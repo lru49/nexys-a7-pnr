@@ -1,0 +1,68 @@
+name: pnr
+on:
+  workflow_dispatch:
+    inputs:
+      variant: { description: "nets/<variant>", required: true }
+      seeds:   { description: "comma-separated seeds", required: true, default: "1" }
+      freq:    { description: "target MHz", required: true, default: "62.5" }
+      extra:   { description: "extra nextpnr options", required: false, default: "" }
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      seeds: ${{ steps.s.outputs.seeds }}
+    steps:
+      - id: s
+        env: { SEEDS: "${{ inputs.seeds }}" }
+        run: echo "seeds=$(python3 -c 'import json,os; print(json.dumps([s.strip() for s in os.environ["SEEDS"].split(",") if s.strip()]))')" >> "$GITHUB_OUTPUT"
+  pnr:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJson(needs.plan.outputs.seeds) }}
+    env:
+      VARIANT: ${{ inputs.variant }}
+      SEED: ${{ matrix.seed }}
+      FREQ: ${{ inputs.freq }}
+      EXTRA: ${{ inputs.extra }}
+      OXC: ${{ github.workspace }}/../oxc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: nets/${{ inputs.variant }}
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../oxc
+          key: openxc7-linux-x86-64-20261014
+      - name: toolchain
+        run: |
+          if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
+            mkdir -p "$OXC"
+            curl -sSL https://github.com/fpgawars/tools-openxc7/releases/download/2026-10-14/apio-openxc7-linux-x86-64-20261014.tgz | tar -xz -C "$OXC"
+          fi
+          "$OXC/bin/nextpnr-xilinx" --version
+      - name: place and route
+        run: |
+          mkdir -p out && cd out
+          gunzip -c "../nets/$VARIANT/top.json.gz" > top.json
+          cp "../nets/$VARIANT/pins.xdc" .
+          set +e
+          "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
+            --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+            --json top.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
+            -o xdc=pins.xdc -o fasm=top.fasm --report report.json > pnr.log 2>&1
+          echo "exit=$?" >> pnr.log
+          rm -f top.json
+          [ -f top.fasm ] && gzip -9 top.fasm
+          grep -E "Max frequency" pnr.log | tail -4 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pnr-${{ inputs.variant }}-s${{ matrix.seed }}
+          path: out/
+          retention-days: 7
