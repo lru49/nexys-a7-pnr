@@ -7,7 +7,8 @@ on:
       freq:    { description: "target MHz", required: true, default: "62.5" }
       extra:   { description: "extra nextpnr options", required: false, default: "" }
       maxiter: { description: "kill the router after this many iterations (0 = never)", required: false, default: "60" }
-      nextpnr: { description: "release = the openXC7 release binary; r43 = openXC7/nextpnr 8006fbc6f8f7 + patches/nextpnr-r43.patch, built here", required: false, default: "release" }
+      nextpnr: { description: "release = the openXC7 release binary; r43 = openXC7/nextpnr 8006fbc6f8f7 + patches/nextpnr-r43.patch, built here; np31 = r43 + patches/nextpnr-np31.patch (env-gated placer knobs)", required: false, default: "release" }
+      npenv:   { description: "environment for nextpnr, e.g. NP_TMG_K=20 NP_TMG_CAP=0 (np31 knobs)", required: false, default: "" }
 permissions:
   contents: read
 jobs:
@@ -21,13 +22,16 @@ jobs:
         run: echo "seeds=$(python3 -c 'import json,os; print(json.dumps([s.strip() for s in os.environ["SEEDS"].split(",") if s.strip()]))')" >> "$GITHUB_OUTPUT"
   build:
     runs-on: ubuntu-latest
-    if: ${{ inputs.nextpnr == 'r43' }}
+    if: ${{ inputs.nextpnr == 'r43' || inputs.nextpnr == 'np31' }}
     steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: patches
       - id: k
-        run: echo "key=nextpnr-8006fbc6f8f7-$(sha256sum patches/nextpnr-r43.patch | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        env: { NPV: "${{ inputs.nextpnr }}" }
+        run: |
+          P=patches/nextpnr-r43.patch; [ "$NPV" = np31 ] && P="$P patches/nextpnr-np31.patch"
+          echo "key=nextpnr-8006fbc6f8f7-$(cat $P | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         id: c
         with:
@@ -41,6 +45,7 @@ jobs:
           git clone -q https://github.com/openXC7/nextpnr /tmp/nextpnr
           cd /tmp/nextpnr && git checkout -q 8006fbc6f8f7
           git apply "$GITHUB_WORKSPACE/patches/nextpnr-r43.patch"
+          if [ "${{ inputs.nextpnr }}" = np31 ]; then git apply "$GITHUB_WORKSPACE/patches/nextpnr-np31.patch"; fi
           git diff --stat
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DARCH=himbaechel -DHIMBAECHEL_UARCH=xilinx \
             -DHIMBAECHEL_XILINX_DEVICES="" -DHIMBAECHEL_PRJXRAY_DB=/tmp/no-prjxray-db -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
@@ -65,6 +70,7 @@ jobs:
       EXTRA: ${{ inputs.extra }}
       MAXITER: ${{ inputs.maxiter }}
       NEXTPNR: ${{ inputs.nextpnr }}
+      NPENV: ${{ inputs.npenv }}
       OXC: /home/runner/oxc
     steps:
       - uses: actions/checkout@v4
@@ -73,10 +79,13 @@ jobs:
             nets/${{ inputs.variant }}
             patches
       - id: k
-        if: ${{ inputs.nextpnr == 'r43' }}
-        run: echo "key=nextpnr-8006fbc6f8f7-$(sha256sum patches/nextpnr-r43.patch | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        if: ${{ inputs.nextpnr == 'r43' || inputs.nextpnr == 'np31' }}
+        env: { NPV: "${{ inputs.nextpnr }}" }
+        run: |
+          P=patches/nextpnr-r43.patch; [ "$NPV" = np31 ] && P="$P patches/nextpnr-np31.patch"
+          echo "key=nextpnr-8006fbc6f8f7-$(cat $P | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v4
-        if: ${{ inputs.nextpnr == 'r43' }}
+        if: ${{ inputs.nextpnr == 'r43' || inputs.nextpnr == 'np31' }}
         with:
           path: /home/runner/npr
           key: ${{ steps.k.outputs.key }}
@@ -94,16 +103,16 @@ jobs:
             tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
           fi
           "$OXC/bin/nextpnr-xilinx" --version
-          if [ "$NEXTPNR" = r43 ]; then sudo apt-get install -y -qq libboost-program-options1.83.0 libboost-iostreams1.83.0 libboost-thread1.83.0 libboost-filesystem1.83.0 >/dev/null 2>&1 || sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev; "/home/runner/npr/nextpnr-himbaechel" --version; fi
+          if [ "$NEXTPNR" != release ]; then sudo apt-get install -y -qq libboost-program-options1.83.0 libboost-iostreams1.83.0 libboost-thread1.83.0 libboost-filesystem1.83.0 >/dev/null 2>&1 || sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev; "/home/runner/npr/nextpnr-himbaechel" --version; fi
       - name: place and route
         run: |
           mkdir -p out && cd out
           gunzip -c "../nets/$VARIANT/top.json.gz" > top.json
           cp "../nets/$VARIANT/pins.xdc" .
           set +e
-          NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" = r43 ] && NPR="/home/runner/npr/nextpnr-himbaechel"
-          echo "binary: $NPR ($NEXTPNR)" > pnr.log
-          "$NPR" --device xc7a100tcsg324-1 \
+          NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" != release ] && NPR="/home/runner/npr/nextpnr-himbaechel"
+          echo "binary: $NPR ($NEXTPNR) env: $NPENV" > pnr.log
+          env $NPENV "$NPR" --device xc7a100tcsg324-1 \
             --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
             --json top.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
             -o xdc=pins.xdc -o fasm=top.fasm --report report.json >> pnr.log 2>&1 &

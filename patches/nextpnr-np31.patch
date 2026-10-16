@@ -1,0 +1,75 @@
+--- a/common/place/placer_static.cc	2026-10-16 19:11:46.889976699 -0400
++++ b/common/place/placer_static.cc	2026-10-16 19:11:46.909653670 -0400
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "placer_static.h"
++#include <cstdlib>
+ #include "static_util.h"
+ 
+ #include <boost/optional.hpp>
+@@ -632,7 +633,23 @@
+         }
+     }
+ 
+-    const double target_util = 0.7;
++    // research r31 np-util: NP_UTIL = global spacer target (default 0.7); NP_UTIL_<GROUP> per group
++    // (e.g. NP_UTIL_FF=0 inserts no FF spacers)
++    static double np_env(const char *name, double dflt)
++    {
++        const char *v = std::getenv(name);
++        return (v && *v) ? std::atof(v) : dflt;
++    }
++    const double target_util = np_env("NP_UTIL", 0.7);
++    double group_target(const std::string &name) const
++    {
++        return np_env(("NP_UTIL_" + name).c_str(), target_util);
++    }
++    // research r31 np-tmg: weight 1 + K crit^2 (NP_TMG_K, default 5); driver-side criticality for nets with
++    // fewer than NP_TMG_CAP users (default 5; 0 = every net); timing update every NP_TMG_PERIOD iterations (default 10)
++    const float np_tmg_k = np_env("NP_TMG_K", 5.0);
++    const int np_tmg_cap = int(np_env("NP_TMG_CAP", 5));
++    const int np_tmg_period = std::max(1, int(np_env("NP_TMG_PERIOD", 10)));
+ 
+     void insert_dark()
+     {
+@@ -661,11 +678,12 @@
+             const auto &cg = cfg.cell_groups.at(group);
+             const auto &g = groups.at(group);
+             double util = g.concrete_area / g.total_area;
++            const double gt = group_target(cg.name.str(ctx));
+             log_info("⌁   group %s pre-spacer utilisation %.02f%% (target %.02f%%)\n", ctx->nameOf(cg.name),
+-                     (util * 100.0), (target_util * 100.0));
++                     (util * 100.0), (gt * 100.0));
+             // TODO: better computation of spacer size and placement?
+             int inserted_spacers = 0;
+-            int spacer_count = (g.total_area * target_util - g.concrete_area) / cg.spacer_rect.area();
++            int spacer_count = (g.total_area * gt - g.concrete_area) / cg.spacer_rect.area();
+             if (spacer_count <= 0)
+                 continue;
+             while (inserted_spacers < spacer_count) {
+@@ -963,13 +981,13 @@
+                 if (port.second.type == PORT_IN) {
+                     crit = tmg.get_criticality(CellPortKey(cell->name, port.first));
+                 } else if (port.second.type == PORT_OUT) {
+-                    if (ni && ni->users.entries() < 5) {
++                    if (ni && (np_tmg_cap <= 0 || int(ni->users.entries()) < np_tmg_cap)) {
+                         for (auto usr : ni->users)
+                             crit = std::max(crit, tmg.get_criticality(CellPortKey(usr)));
+                     }
+                 }
+             }
+-            float weight = 1.0 + 5 * std::pow(crit, 2);
++            float weight = 1.0 + np_tmg_k * std::pow(crit, 2);
+             gradient += weight * (d_min - d_max);
+         }
+ 
+@@ -1280,7 +1298,7 @@
+         }
+         log_info("   system potential: %f hpwl: %f\n", system_potential(), system_hpwl());
+         compute_overlap();
+-        if ((iter % 10) == 0)
++        if ((iter % np_tmg_period) == 0)
+             update_timing();
+     }
+ 
