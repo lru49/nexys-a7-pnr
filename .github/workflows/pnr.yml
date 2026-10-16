@@ -7,6 +7,7 @@ on:
       freq:    { description: "target MHz", required: true, default: "62.5" }
       extra:   { description: "extra nextpnr options", required: false, default: "" }
       maxiter: { description: "kill the router after this many iterations (0 = never)", required: false, default: "60" }
+      nextpnr: { description: "release = the openXC7 release binary; r43 = openXC7/nextpnr 8006fbc6f8f7 + patches/nextpnr-r43.patch, built here", required: false, default: "release" }
 permissions:
   contents: read
 jobs:
@@ -18,8 +19,37 @@ jobs:
       - id: s
         env: { SEEDS: "${{ inputs.seeds }}" }
         run: echo "seeds=$(python3 -c 'import json,os; print(json.dumps([s.strip() for s in os.environ["SEEDS"].split(",") if s.strip()]))')" >> "$GITHUB_OUTPUT"
+  build:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.nextpnr == 'r43' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: patches
+      - id: k
+        run: echo "key=nextpnr-8006fbc6f8f7-$(sha256sum patches/nextpnr-r43.patch | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: c
+        with:
+          path: ${{ github.workspace }}/../npr
+          key: ${{ steps.k.outputs.key }}
+      - name: build nextpnr-xilinx (himbaechel) from public source + patch
+        if: steps.c.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev libboost-system-dev libeigen3-dev ninja-build cmake
+          git clone -q https://github.com/openXC7/nextpnr /tmp/nextpnr
+          cd /tmp/nextpnr && git checkout -q 8006fbc6f8f7
+          git apply "$GITHUB_WORKSPACE/patches/nextpnr-r43.patch"
+          git diff --stat
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DARCH=himbaechel -DHIMBAECHEL_UARCH=xilinx \
+            -DHIMBAECHEL_XILINX_DEVICES="" -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
+          cmake --build build -j 4
+          mkdir -p "$GITHUB_WORKSPACE/../npr" && cp build/nextpnr-himbaechel "$GITHUB_WORKSPACE/../npr/"
+      - run: ls -la "$GITHUB_WORKSPACE/../npr" && "$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel" --version
   pnr:
-    needs: plan
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
     strategy:
@@ -32,11 +62,23 @@ jobs:
       FREQ: ${{ inputs.freq }}
       EXTRA: ${{ inputs.extra }}
       MAXITER: ${{ inputs.maxiter }}
+      NEXTPNR: ${{ inputs.nextpnr }}
       OXC: ${{ github.workspace }}/../oxc
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: nets/${{ inputs.variant }}
+          sparse-checkout: |
+            nets/${{ inputs.variant }}
+            patches
+      - id: k
+        if: ${{ inputs.nextpnr == 'r43' }}
+        run: echo "key=nextpnr-8006fbc6f8f7-$(sha256sum patches/nextpnr-r43.patch | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        if: ${{ inputs.nextpnr == 'r43' }}
+        with:
+          path: ${{ github.workspace }}/../npr
+          key: ${{ steps.k.outputs.key }}
+          fail-on-cache-miss: true
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../oxc
@@ -50,16 +92,19 @@ jobs:
             tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
           fi
           "$OXC/bin/nextpnr-xilinx" --version
+          if [ "$NEXTPNR" = r43 ]; then sudo apt-get install -y -qq libboost-program-options1.83.0 libboost-iostreams1.83.0 libboost-thread1.83.0 libboost-filesystem1.83.0 >/dev/null 2>&1 || sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev; "$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel" --version; fi
       - name: place and route
         run: |
           mkdir -p out && cd out
           gunzip -c "../nets/$VARIANT/top.json.gz" > top.json
           cp "../nets/$VARIANT/pins.xdc" .
           set +e
-          "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
+          NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" = r43 ] && NPR="$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel"
+          echo "binary: $NPR ($NEXTPNR)" > pnr.log
+          "$NPR" --device xc7a100tcsg324-1 \
             --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
             --json top.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
-            -o xdc=pins.xdc -o fasm=top.fasm --report report.json > pnr.log 2>&1 &
+            -o xdc=pins.xdc -o fasm=top.fasm --report report.json >> pnr.log 2>&1 &
           PID=$!
           while kill -0 $PID 2>/dev/null; do
             sleep 20

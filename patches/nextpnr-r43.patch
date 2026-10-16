@@ -1,0 +1,246 @@
+diff --git a/common/place/placer_static.cc b/common/place/placer_static.cc
+index 1c2c259a..0577a3fa 100644
+--- a/common/place/placer_static.cc
++++ b/common/place/placer_static.cc
+@@ -1582,14 +1582,20 @@ class StaticPlacer
+                             if (!target.first->testRegion(target.second))
+                                 goto fail;
+                             CellInfo *bound = ctx->getBoundBelCell(target.second);
++                            // A member already bound (pre-placed) can only stay where it is: binding it again
++                            // elsewhere would leave its old bel pointing at it
++                            if (target.first->bel != BelId() && target.first->bel != target.second)
++                                goto fail;
+                             // Chains cannot overlap; so if we have to ripup a cell make sure it isn't part of a chain
+-                            if (bound != nullptr)
++                            if (bound != nullptr && bound != target.first)
+                                 if (bound->cluster != ClusterId() || bound->belStrength > STRENGTH_WEAK)
+                                     goto fail;
+                         }
+                         // Actually perform the move; keeping track of the moves we make so we can revert them if needed
+                         for (auto &target : targets) {
+                             CellInfo *bound = ctx->getBoundBelCell(target.second);
++                            if (bound == target.first)
++                                continue; // pre-placed member, already there
+                             if (bound != nullptr)
+                                 ctx->unbindBel(target.second);
+                             ctx->bindBel(target.second, target.first, STRENGTH_STRONG);
+diff --git a/himbaechel/uarch/xilinx/xilinx.cc b/himbaechel/uarch/xilinx/xilinx.cc
+index 808215ad..1e7938b2 100644
+--- a/himbaechel/uarch/xilinx/xilinx.cc
++++ b/himbaechel/uarch/xilinx/xilinx.cc
+@@ -684,17 +684,113 @@ void XilinxImpl::apply_preplaced(bool verbose)
+         }
+         it->second->attrs[ctx->id("BEL")] = line.substr(tab + 1);
+         pinned++;
+-        // The pinned cells' tiles are theirs alone: a new cell placed beside
+-        // them would need site routing (bypass pins, output muxes) the
+-        // reference routes may already lock, and the router cannot rip those up.
+-        BelId bel = ctx->getBelByNameStr(line.substr(tab + 1));
+-        const bool bel_name_resolved = (bel != BelId());
+-        if (bel_name_resolved)
+-            frozen_tiles.insert(bel.tile);
+     }
++    // A cluster (LUT6+LUT5 pair, LUT+FF pair, carry chain, DSP cascade) is
++    // placed as one unit, so a pin on some of its cells but not the others is
++    // inconsistent: the static placer leaves such a cluster unfixed, its
++    // legaliser then binds the already-pinned child a second time at the
++    // cluster's new location (bindBel does not unbind the old bel), and the
++    // stale bel->cell entry trips "entry == nullptr" (base_arch.h) as soon as
++    // SA refinement moves anything onto it.  Make every touched cluster whole:
++    // pin all of its cells where the pinned ones imply the root goes, or, if no
++    // root position agrees with all of the pins, unpin the cluster.
++    int completed = 0, dropped = 0;
++    {
++        dict<BelId, CellInfo *> pinned_at;
++        auto pin_of = [&](CellInfo *ci) -> BelId {
++            auto f = ci->attrs.find(ctx->id("BEL"));
++            return f == ci->attrs.end() ? BelId() : ctx->getBelByNameStr(f->second.as_string());
++        };
++        for (auto &c : ctx->cells) {
++            BelId b = pin_of(c.second.get());
++            if (b != BelId())
++                pinned_at[b] = c.second.get();
++        }
++        pool<ClusterId> seen;
++        for (auto &c : ctx->cells) {
++            CellInfo *ci = c.second.get();
++            if (ci->cluster == ClusterId() || seen.count(ci->cluster))
++                continue;
++            seen.insert(ci->cluster);
++            CellInfo *root = ctx->getClusterRootCell(ci->cluster);
++            std::vector<CellInfo *> members{root};
++            for (CellInfo *child : root->constr_children)
++                members.push_back(child);
++            std::vector<CellInfo *> with_pin;
++            for (CellInfo *m : members)
++                if (pin_of(m) != BelId())
++                    with_pin.push_back(m);
++            if (with_pin.empty() || with_pin.size() == members.size())
++                continue; // untouched, or pinned whole (a consistent reference)
++            // Candidate root bels: the root's own pin, else every bel of the
++            // root's type in the tile a pinned child's offset points back to.
++            std::vector<BelId> cand;
++            BelId root_pin = pin_of(root);
++            if (root_pin != BelId()) {
++                cand.push_back(root_pin);
++            } else {
++                CellInfo *p = with_pin.front();
++                Loc pl = ctx->getBelLocation(pin_of(p)), off = ctx->getClusterOffset(p);
++                int rx = pl.x - off.x, ry = pl.y - off.y;
++                if (rx >= 0 && ry >= 0 && rx < ctx->getGridDimX() && ry < ctx->getGridDimY())
++                    for (BelId b : ctx->getBelsByTile(rx, ry))
++                        if (ctx->isValidBelForCellType(root->type, b))
++                            cand.push_back(b);
++            }
++            bool done = false;
++            for (BelId rb : cand) {
++                std::vector<std::pair<CellInfo *, BelId>> pl;
++                if (!ctx->getClusterPlacement(root->cluster, rb, pl) || pl.size() != members.size())
++                    continue;
++                bool agrees = true;
++                for (auto &e : pl) {
++                    BelId want = pin_of(e.first);
++                    auto occ = pinned_at.find(e.second);
++                    bool clashes = occ != pinned_at.end() && occ->second != e.first;
++                    if ((want != BelId() && want != e.second) || clashes) {
++                        agrees = false;
++                        break;
++                    }
++                }
++                if (!agrees)
++                    continue;
++                for (auto &e : pl)
++                    if (pin_of(e.first) == BelId()) {
++                        e.first->attrs[ctx->id("BEL")] = ctx->getBelName(e.second).str(ctx);
++                        pinned_at[e.second] = e.first;
++                        completed++;
++                    }
++                done = true;
++                break;
++            }
++            if (!done) {
++                for (CellInfo *m : with_pin) {
++                    pinned_at.erase(pin_of(m));
++                    m->attrs.erase(ctx->id("BEL"));
++                    dropped++;
++                }
++            }
++        }
++    }
++    // The pinned cells' tiles are theirs alone when their routes are replayed
++    // too (-o prerouted): a new cell placed beside them would need site
++    // routing (bypass pins, output muxes) the reference routes may already
++    // lock, and the router cannot rip those up.  Without prerouted there is
++    // nothing locked; closing ~2.5k tiles only starves the placer (the strict
++    // legaliser then grows HPWL ~4x), so the tiles stay open.
++    if (args.options.count("prerouted"))
++        for (auto &c : ctx->cells) {
++            auto f = c.second->attrs.find(ctx->id("BEL"));
++            if (f == c.second->attrs.end())
++                continue;
++            BelId bel = ctx->getBelByNameStr(f->second.as_string());
++            if (bel != BelId())
++                frozen_tiles.insert(bel.tile);
++        }
+     if (verbose)
+-        log_info("Pre-placed: %d cell(s) pinned to their reference bel, %d not in this design; %d tile(s) closed to other cells.\n",
+-                 pinned, missing, int(frozen_tiles.size()));
++        log_info("Pre-placed: %d cell(s) pinned to their reference bel, %d not in this design; clusters: %d cell(s) "
++                 "added, %d pin(s) dropped; %d tile(s) closed to other cells.\n",
++                 pinned, missing, completed, dropped, int(frozen_tiles.size()));
+ }
+ 
+ // -o holdbufs=<file>: one line per hold-fix feedthrough buffer of the
+@@ -865,6 +961,80 @@ void XilinxImpl::prePlace()
+         if (ci->bel != BelId())
+             notifyBelChange(ci->bel, ci);
+     }
++    bind_preplaced();
++}
++
++// The pins come from a reference build of a *different* netlist: two cells
++// that shared a slice there can disagree here (control set, LUT5/LUT6 input
++// sharing, carry use), and the placers bind -o preplaced cells without a
++// validity check, so one bad slice only shows at the post-placement check.
++// Bind the pins now that the cell tags exist, and unpin -- with their whole
++// clusters -- the cells of every tile the pins alone make invalid, until none
++// is left.
++void XilinxImpl::bind_preplaced()
++{
++    if (!ctx->args.options.count("preplaced"))
++        return;
++    std::vector<CellInfo *> pinned;
++    for (auto &c : ctx->cells) {
++        CellInfo *ci = c.second.get();
++        auto f = ci->attrs.find(id_BEL);
++        if (f == ci->attrs.end() || ci->bel != BelId())
++            continue;
++        BelId bel = ctx->getBelByNameStr(f->second.as_string());
++        if (bel == BelId() || !ctx->isValidBelForCellType(ci->type, bel) || !ctx->checkBelAvail(bel)) {
++            ci->attrs.erase(id_BEL);
++            continue;
++        }
++        ctx->bindBel(bel, ci, STRENGTH_USER);
++        pinned.push_back(ci);
++    }
++    int unpinned = 0, bad_tiles = 0, rounds = 0;
++    while (true) {
++        std::vector<CellInfo *> drop;
++        pool<IdString> drop_names;
++        auto add_drop = [&](CellInfo *x) {
++            if (drop_names.insert(x->name).second)
++                drop.push_back(x);
++        };
++        pool<int> seen_tiles;
++        for (CellInfo *ci : pinned) {
++            if (ci->bel == BelId() || seen_tiles.count(ci->bel.tile))
++                continue;
++            if (ctx->isBelLocationValid(ci->bel))
++                continue;
++            seen_tiles.insert(ci->bel.tile);
++            if (bad_tiles < 10)
++                ctx->isBelLocationValid(ci->bel, true); // explain
++            bad_tiles++;
++            int tx, ty;
++            tile_xy(ctx->chip_info, ci->bel.tile, tx, ty);
++            for (BelId b : ctx->getBelsByTile(tx, ty)) {
++                CellInfo *o = ctx->getBoundBelCell(b);
++                if (o == nullptr || o->belStrength != STRENGTH_USER || !o->attrs.count(id_BEL))
++                    continue;
++                add_drop(o);
++                if (o->cluster != ClusterId()) {
++                    CellInfo *root = ctx->getClusterRootCell(o->cluster);
++                    add_drop(root);
++                    for (CellInfo *ch : root->constr_children)
++                        add_drop(ch);
++                }
++            }
++        }
++        if (drop.empty())
++            break;
++        rounds++;
++        for (CellInfo *o : drop) {
++            if (o->bel != BelId() && o->belStrength == STRENGTH_USER)
++                ctx->unbindBel(o->bel);
++            if (o->attrs.erase(id_BEL))
++                unpinned++;
++        }
++    }
++    log_info("Pre-placed: %d cell(s) bound; %d tile(s) invalid with this netlist, %d cell(s) unpinned there (%d "
++             "round(s)).\n",
++             int(pinned.size()) - unpinned, bad_tiles, unpinned, rounds);
+ }
+ 
+ void XilinxImpl::postPlace()
+diff --git a/himbaechel/uarch/xilinx/xilinx.h b/himbaechel/uarch/xilinx/xilinx.h
+index 9d3eef4c..e751fecc 100644
+--- a/himbaechel/uarch/xilinx/xilinx.h
++++ b/himbaechel/uarch/xilinx/xilinx.h
+@@ -180,6 +180,7 @@ struct XilinxImpl : HimbaechelAPI
+     void preRoute() override;
+     void apply_prerouted();
+     void apply_preplaced(bool verbose = true);
++    void bind_preplaced();
+     void apply_holdbufs();
+     void close_routed_tiles();
+     pool<int> frozen_tiles; // tiles holding -o preplaced cells: no other cell may go there
