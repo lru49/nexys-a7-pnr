@@ -6,6 +6,7 @@ on:
       seeds:   { description: "comma-separated seeds", required: true, default: "1" }
       freq:    { description: "target MHz", required: true, default: "62.5" }
       extra:   { description: "extra nextpnr options", required: false, default: "" }
+      maxiter: { description: "kill the router after this many iterations (0 = never)", required: false, default: "60" }
 permissions:
   contents: read
 jobs:
@@ -30,6 +31,7 @@ jobs:
       SEED: ${{ matrix.seed }}
       FREQ: ${{ inputs.freq }}
       EXTRA: ${{ inputs.extra }}
+      MAXITER: ${{ inputs.maxiter }}
       OXC: ${{ github.workspace }}/../oxc
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +57,15 @@ jobs:
           "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
             --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
             --json top.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
-            -o xdc=pins.xdc -o fasm=top.fasm --report report.json > pnr.log 2>&1
+            -o xdc=pins.xdc -o fasm=top.fasm --report report.json > pnr.log 2>&1 &
+          PID=$!
+          while kill -0 $PID 2>/dev/null; do
+            sleep 20
+            if [ "${MAXITER:-0}" -gt 0 ] && [ "$(grep -c ' wires=' pnr.log)" -gt "$MAXITER" ]; then
+              echo "early-kill: router passed $MAXITER iterations" >> pnr.log; kill $PID; break
+            fi
+          done
+          wait $PID
           echo "exit=$?" >> pnr.log
           rm -f top.json
           [ -f top.fasm ] && gzip -9 top.fasm
