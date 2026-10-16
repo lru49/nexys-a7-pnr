@@ -117,6 +117,12 @@ jobs:
           wait $PID
           echo "exit=$?" >> pnr.log
           rm -f top.json
+          if [ -f top.fasm ]; then   # bitgen here too, so no local compute is needed
+            DB="$OXC/share/nextpnr/external/prjxray-db/artix7"; P=xc7a100tcsg324-1
+            "$OXC/bin/fasm2frames" --db-root "$DB" --part $P top.fasm top.frames && \
+              "$OXC/bin/xc7frames2bit" --part_file "$DB/$P/part.yaml" --part_name $P --frm_file top.frames --output_file top.bit
+            rm -f top.frames; [ -f top.bit ] && gzip -9 top.bit
+          fi
           [ -f top.fasm ] && gzip -9 top.fasm
           grep -E "Max frequency" pnr.log | tail -4 || true
       - uses: actions/upload-artifact@v4
@@ -133,3 +139,10 @@ jobs:
           name: pnr-${{ inputs.variant }}-s${{ matrix.seed }}
           path: out/
           retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bit-${{ inputs.variant }}-s${{ matrix.seed }}
+          path: out/top.bit.gz
+          retention-days: 7
+          if-no-files-found: ignore
