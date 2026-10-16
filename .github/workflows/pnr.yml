@@ -43,7 +43,7 @@ jobs:
           git apply "$GITHUB_WORKSPACE/patches/nextpnr-r43.patch"
           git diff --stat
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DARCH=himbaechel -DHIMBAECHEL_UARCH=xilinx \
-            -DHIMBAECHEL_XILINX_DEVICES="" -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
+            -DHIMBAECHEL_XILINX_DEVICES="" -DHIMBAECHEL_PRJXRAY_DB=/tmp/no-prjxray-db -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
           cmake --build build -j 4
           mkdir -p "$GITHUB_WORKSPACE/../npr" && cp build/nextpnr-himbaechel "$GITHUB_WORKSPACE/../npr/"
       - run: ls -la "$GITHUB_WORKSPACE/../npr" && "$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel" --version
