@@ -46,7 +46,9 @@ jobs:
             -DHIMBAECHEL_XILINX_DEVICES="" -DHIMBAECHEL_PRJXRAY_DB=/tmp/no-prjxray-db -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
           cmake --build build -j 4
           mkdir -p "/home/runner/npr" && cp build/nextpnr-himbaechel "/home/runner/npr/"
-      - run: ls -la "/home/runner/npr" && "/home/runner/npr/nextpnr-himbaechel" --version
+      - run: |
+          sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev > /dev/null
+          ls -la /home/runner/npr && /home/runner/npr/nextpnr-himbaechel --version
   pnr:
     needs: [plan, build]
     if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
