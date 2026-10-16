@@ -31,7 +31,7 @@ jobs:
       - uses: actions/cache@v4
         id: c
         with:
-          path: ${{ github.workspace }}/../npr
+          path: /home/runner/npr
           key: ${{ steps.k.outputs.key }}
       - name: build nextpnr-xilinx (himbaechel) from public source + patch
         if: steps.c.outputs.cache-hit != 'true'
@@ -45,8 +45,8 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DARCH=himbaechel -DHIMBAECHEL_UARCH=xilinx \
             -DHIMBAECHEL_XILINX_DEVICES="" -DHIMBAECHEL_PRJXRAY_DB=/tmp/no-prjxray-db -DBUILD_PYTHON=OFF -DBUILD_GUI=OFF
           cmake --build build -j 4
-          mkdir -p "$GITHUB_WORKSPACE/../npr" && cp build/nextpnr-himbaechel "$GITHUB_WORKSPACE/../npr/"
-      - run: ls -la "$GITHUB_WORKSPACE/../npr" && "$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel" --version
+          mkdir -p "/home/runner/npr" && cp build/nextpnr-himbaechel "/home/runner/npr/"
+      - run: ls -la "/home/runner/npr" && "/home/runner/npr/nextpnr-himbaechel" --version
   pnr:
     needs: [plan, build]
     if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
@@ -63,7 +63,7 @@ jobs:
       EXTRA: ${{ inputs.extra }}
       MAXITER: ${{ inputs.maxiter }}
       NEXTPNR: ${{ inputs.nextpnr }}
-      OXC: ${{ github.workspace }}/../oxc
+      OXC: /home/runner/oxc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,12 +76,12 @@ jobs:
       - uses: actions/cache/restore@v4
         if: ${{ inputs.nextpnr == 'r43' }}
         with:
-          path: ${{ github.workspace }}/../npr
+          path: /home/runner/npr
           key: ${{ steps.k.outputs.key }}
           fail-on-cache-miss: true
       - uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/../oxc
+          path: /home/runner/oxc
           key: openxc7-linux-x86-64-20261012
       - name: toolchain
         run: |
@@ -92,14 +92,14 @@ jobs:
             tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
           fi
           "$OXC/bin/nextpnr-xilinx" --version
-          if [ "$NEXTPNR" = r43 ]; then sudo apt-get install -y -qq libboost-program-options1.83.0 libboost-iostreams1.83.0 libboost-thread1.83.0 libboost-filesystem1.83.0 >/dev/null 2>&1 || sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev; "$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel" --version; fi
+          if [ "$NEXTPNR" = r43 ]; then sudo apt-get install -y -qq libboost-program-options1.83.0 libboost-iostreams1.83.0 libboost-thread1.83.0 libboost-filesystem1.83.0 >/dev/null 2>&1 || sudo apt-get install -y -qq libboost-program-options-dev libboost-iostreams-dev libboost-thread-dev libboost-filesystem-dev; "/home/runner/npr/nextpnr-himbaechel" --version; fi
       - name: place and route
         run: |
           mkdir -p out && cd out
           gunzip -c "../nets/$VARIANT/top.json.gz" > top.json
           cp "../nets/$VARIANT/pins.xdc" .
           set +e
-          NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" = r43 ] && NPR="$GITHUB_WORKSPACE/../npr/nextpnr-himbaechel"
+          NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" = r43 ] && NPR="/home/runner/npr/nextpnr-himbaechel"
           echo "binary: $NPR ($NEXTPNR)" > pnr.log
           "$NPR" --device xc7a100tcsg324-1 \
             --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
