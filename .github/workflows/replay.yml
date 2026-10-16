@@ -85,8 +85,32 @@ jobs:
                           f.write(f'{tname[r[3]]}\t{r[2]}\n'); n += 1; by[r[1]] += 1; used.add(r[2])
               print(f'{n} of {len(inscope)} in-scope reference cells pinned')
               for t in sorted(tot, key=lambda t: -tot[t])[:12]: print(f'  {t:12s} {by[t]:6d} / {tot[t]:6d}')
+          def tobel(tsv, tilegrid, out):
+              """--write JSON gives NEXTPNR_BEL as SITE/BEL (SLICE_X78Y102/C6LUT); -o preplaced wants the himbaechel
+              name X<grid_x>Y<grid_y>/<PREFIX>_X<rel>Y<rel>.<BEL> (rel = index of the site among its tile's sites
+              of that prefix), e.g. CLBLM_L_X26Y63 (grid 65,142) SLICE_X42Y63 -> X65Y142/SLICE_X0Y0."""
+              tg = json.load(open(tilegrid)); site = {}
+              sre = re.compile(r'^(.*)_X(\d+)Y(\d+)$')
+              for t in tg.values():
+                  by = {}
+                  for sn in t.get('sites', {}):
+                      m = sre.match(sn)
+                      if m: by.setdefault(m.group(1), []).append((sn, int(m.group(2)), int(m.group(3))))
+                  for pre, L in by.items():
+                      x0 = min(l[1] for l in L); y0 = min(l[2] for l in L)
+                      for sn, x, y in L: site[sn] = f"X{t['grid_x']}Y{t['grid_y']}/{pre}_X{x - x0}Y{y - y0}"
+              n = bad = 0
+              with open(out, 'w') as f:
+                  for l in open(tsv):
+                      r = l.rstrip('\n').split('\t')
+                      if len(r) == 4 and r[2] != '-' and '/' in r[2]:
+                          sn, bel = r[2].split('/', 1)
+                          if sn in site: r[2] = site[sn] + '.' + bel; n += 1
+                          else: bad += 1
+                      f.write('\t'.join(r) + '\n')
+              print(f'tobel: {n} bels converted, {bad} sites not in the tilegrid')
           if __name__ == '__main__':
-              {'table': lambda a: table(*a), 'match': lambda a: match(*a)}[sys.argv[1]](sys.argv[2:])
+              {'table': lambda a: table(*a), 'match': lambda a: match(*a), 'tobel': lambda a: tobel(*a)}[sys.argv[1]](sys.argv[2:])
           PY
           python3 -c "import ast,sys; ast.parse(open('/home/runner/rp/replay_cells.py').read())"
       - name: reference place and route
@@ -98,7 +122,9 @@ jobs:
             --json ref.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
             -o xdc="$GITHUB_WORKSPACE/nets/$REF/pins.xdc" --write ref_placed.json > ref.log 2>&1 || echo "nextpnr exit $?"
           grep -E "Max frequency|Routing complete" ref.log | tail -5
-          python3 /home/runner/rp/replay_cells.py table ref_placed.json ref.tsv
+          python3 /home/runner/rp/replay_cells.py table ref_placed.json ref_site.tsv
+          python3 /home/runner/rp/replay_cells.py tobel ref_site.tsv "$OXC/share/nextpnr/external/prjxray-db/artix7/xc7a100t/tilegrid.json" ref.tsv
+          grep -v -P '\t-\t' ref.tsv | head -3
           wc -l ref.tsv
       - name: targets
         run: |
