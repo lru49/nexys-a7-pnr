@@ -1,0 +1,130 @@
+name: replay
+# Placement replay pin lists: place + route a reference netlist (one seed), then pin the in-scope cells of each target
+# netlist to the reference bels (-o preplaced= format: target-cell TAB bel). The lists are committed as
+# nets/<target>/preplaced_<tag>.txt, for pnr.yml with extra "-o preplaced=../nets/<target>/preplaced_<tag>.txt".
+on:
+  workflow_dispatch:
+    inputs:
+      ref:      { description: "reference nets/<variant>", required: true }
+      seed:     { description: "reference seed", required: true }
+      freq:     { description: "reference --freq (MHz)", required: true, default: "75" }
+      extra:    { description: "reference extra nextpnr options", required: false, default: "--placer static" }
+      targets:  { description: "comma-separated target nets/<variant>", required: true }
+      scope:    { description: "regex on the cell key (type|port=net,...)", required: false, default: '=(CL\.|sdram_|roundrobin|litedram)' }
+      tag:      { description: "pin file tag (preplaced_<tag>.txt)", required: true }
+permissions:
+  contents: write
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      REF: ${{ inputs.ref }}
+      SEED: ${{ inputs.seed }}
+      FREQ: ${{ inputs.freq }}
+      EXTRA: ${{ inputs.extra }}
+      TARGETS: ${{ inputs.targets }}
+      SCOPE: ${{ inputs.scope }}
+      TAG: ${{ inputs.tag }}
+      OXC: /home/runner/oxc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/oxc
+          key: openxc7-linux-x86-64-20261012
+      - name: toolchain
+        run: |
+          if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
+            mkdir -p "$OXC"
+            curl -sSL -o /tmp/oxc.tgz https://github.com/cavearr/toolchain-openxc7-releases/releases/download/2026-10-12/openxc7-toolchain-linux-x86-64-20261012.tgz
+            echo "a0d583457dee3644fdca83e556a8106c58aba5fb88f23e30f1270f3a309d0ec8  /tmp/oxc.tgz" | sha256sum -c -
+            tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
+          fi
+          "$OXC/bin/nextpnr-xilinx" --version
+      - name: helper
+        run: |
+          mkdir -p /home/runner/rp
+          cat > /home/runner/rp/replay_cells.py <<'PY'
+          import json, re, sys
+          from collections import Counter
+          CLRE = re.compile(r'VexRiscvLitexSmpCluster_[A-Za-z0-9_]*?(_NoMmu[A-Za-z_]*)?\.')
+          def norm(n): return CLRE.sub('CL.', n)
+          def table(src, out):
+              m = json.load(open(src))['modules']
+              top = next(v for v in m.values() if v.get('attributes', {}).get('top'))
+              name_of = {}
+              for name, net in top['netnames'].items():
+                  if name.startswith('$'): continue
+                  for b in net['bits']:
+                      if isinstance(b, int): name_of.setdefault(b, set()).add(norm(name))
+              with open(out, 'w') as f:
+                  for name, c in top['cells'].items():
+                      outs = set()
+                      for port, bits in c['connections'].items():
+                          if c.get('port_directions', {}).get(port) == 'output':
+                              for b in bits:
+                                  if isinstance(b, int):
+                                      for n in name_of.get(b, ()): outs.add(port + '=' + n)
+                      key = (c['type'] + '|' + ','.join(sorted(outs))) if outs else ''
+                      bel = c.get('attributes', {}).get('NEXTPNR_BEL', '-')
+                      f.write(f'{name}\t{c["type"]}\t{bel}\t{key}\n')
+          def load(p):
+              rows = [l.rstrip('\n').split('\t') for l in open(p)]
+              return [r for r in rows if len(r) == 4]
+          def match(ref, tgt, scope, out):
+              R, T = load(ref), load(tgt); sc = re.compile(scope)
+              rk = Counter(r[3] for r in R if r[3]); tk = Counter(t[3] for t in T if t[3])
+              tname = {t[3]: t[0] for t in T if t[3] and tk[t[3]] == 1}
+              inscope = [r for r in R if r[3] and r[2] != '-' and sc.search(r[3])]
+              n = 0; by = Counter(); tot = Counter(); used = set()
+              with open(out, 'w') as f:
+                  for r in inscope:
+                      tot[r[1]] += 1
+                      if rk[r[3]] == 1 and r[3] in tname and r[2] not in used:
+                          f.write(f'{tname[r[3]]}\t{r[2]}\n'); n += 1; by[r[1]] += 1; used.add(r[2])
+              print(f'{n} of {len(inscope)} in-scope reference cells pinned')
+              for t in sorted(tot, key=lambda t: -tot[t])[:12]: print(f'  {t:12s} {by[t]:6d} / {tot[t]:6d}')
+          if __name__ == '__main__':
+              {'table': lambda a: table(*a), 'match': lambda a: match(*a)}[sys.argv[1]](sys.argv[2:])
+          PY
+          python3 -c "import ast,sys; ast.parse(open('/home/runner/rp/replay_cells.py').read())"
+      - name: reference place and route
+        run: |
+          mkdir -p /home/runner/w && cd /home/runner/w
+          gunzip -c "$GITHUB_WORKSPACE/nets/$REF/top.json.gz" > ref.json
+          "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
+            --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+            --json ref.json --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
+            -o xdc="$GITHUB_WORKSPACE/nets/$REF/pins.xdc" --write ref_placed.json > ref.log 2>&1 || echo "nextpnr exit $?"
+          grep -E "Max frequency|Routing complete" ref.log | tail -5
+          python3 /home/runner/rp/replay_cells.py table ref_placed.json ref.tsv
+          wc -l ref.tsv
+      - name: targets
+        run: |
+          cd /home/runner/w
+          for T in $(echo "$TARGETS" | tr ',' ' '); do
+            gunzip -c "$GITHUB_WORKSPACE/nets/$T/top.json.gz" > tgt.json
+            "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
+              --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+              --json tgt.json -o xdc="$GITHUB_WORKSPACE/nets/$T/pins.xdc" --pack-only --write tgt_pk.json > pack_$T.log 2>&1 || echo "pack exit $?"
+            python3 /home/runner/rp/replay_cells.py table tgt_pk.json tgt_$T.tsv
+            echo "== $T"
+            python3 /home/runner/rp/replay_cells.py match ref.tsv tgt_$T.tsv "$SCOPE" "$GITHUB_WORKSPACE/nets/$T/preplaced_$TAG.txt"
+          done
+          rm -f tgt.json tgt_pk.json ref.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: replay-${{ inputs.ref }}-s${{ inputs.seed }}-${{ inputs.tag }}
+          path: |
+            /home/runner/w/ref.log
+            /home/runner/w/pack_*.log
+          retention-days: 7
+      - name: commit pin lists
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config user.name pnr-runner; git config user.email pnr-runner@example.invalid
+          git add nets/*/preplaced_$TAG.txt
+          git commit -q -m "replay pins $TAG: $REF s$SEED @$FREQ -> $TARGETS"
+          for i in 1 2 3 4 5; do git pull -q --rebase && git push -q && break; sleep 10; done
