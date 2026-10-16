@@ -1,0 +1,110 @@
+name: reclock
+# Re-clock a routed design without new placement/routing: reproduce the routed seed, then for each MMCM plan route a copy
+# of the netlist whose MMCME2_ADV parameters are changed, take only its `<tile>.MMCME2_ADV.*` FASM lines, swap them into
+# the original FASM, and run fasm2frames + xc7frames2bit. plans = name:MULT:D0:D1:D2:D3[,...] (100 MHz in, DIVCLK 1,
+# CLKOUT2 keeps its 90 degree phase).
+on:
+  workflow_dispatch:
+    inputs:
+      variant: { description: "nets/<variant>", required: true }
+      seed:    { description: "seed of the routed design", required: true }
+      freq:    { description: "--freq of the routed design", required: true }
+      extra:   { description: "extra nextpnr options of the routed design", required: false, default: "--placer static" }
+      plans:   { description: "name:MULT:D0:D1:D2:D3, comma-separated", required: true }
+permissions:
+  contents: read
+jobs:
+  reclock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      VARIANT: ${{ inputs.variant }}
+      SEED: ${{ inputs.seed }}
+      FREQ: ${{ inputs.freq }}
+      EXTRA: ${{ inputs.extra }}
+      PLANS: ${{ inputs.plans }}
+      OXC: /home/runner/oxc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: nets/${{ inputs.variant }}
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/oxc
+          key: openxc7-linux-x86-64-20261012
+      - name: toolchain
+        run: |
+          if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
+            mkdir -p "$OXC"
+            curl -sSL -o /tmp/oxc.tgz https://github.com/cavearr/toolchain-openxc7-releases/releases/download/2026-10-12/openxc7-toolchain-linux-x86-64-20261012.tgz
+            echo "a0d583457dee3644fdca83e556a8106c58aba5fb88f23e30f1270f3a309d0ec8  /tmp/oxc.tgz" | sha256sum -c -
+            tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
+          fi
+          ls "$OXC/bin" | grep -E "fasm2frames|xc7frames2bit|nextpnr"
+          ls "$OXC/share/nextpnr/external/prjxray-db/artix7/xc7a100tcsg324-1/part.yaml"
+      - name: run
+        run: |
+          mkdir -p /home/runner/w/out && cd /home/runner/w
+          DB="$OXC/share/nextpnr/external/prjxray-db/artix7"; PART=xc7a100tcsg324-1
+          pnr() {  # json fasm log
+            "$OXC/bin/nextpnr-xilinx" --device $PART --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+              --json "$1" --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
+              -o xdc="$GITHUB_WORKSPACE/nets/$VARIANT/pins.xdc" -o fasm="$2" > "$3" 2>&1 || echo "nextpnr exit $?"
+            grep -E "Max frequency" "$3" | tail -5
+          }
+          bitgen() {  # fasm bit
+            "$OXC/bin/fasm2frames" --db-root "$DB" --part $PART "$1" "${1%.fasm}.frames"
+            "$OXC/bin/xc7frames2bit" --part_file "$DB/$PART/part.yaml" --part_name $PART --frm_file "${1%.fasm}.frames" --output_file "$2"
+            rm -f "${1%.fasm}.frames"
+          }
+          gunzip -c "$GITHUB_WORKSPACE/nets/$VARIANT/top.json.gz" > orig.json
+          echo "== original $VARIANT s$SEED @$FREQ"; pnr orig.json orig.fasm out/orig.log
+          bitgen orig.fasm out/orig.bit; md5sum out/orig.bit | tee out/orig.md5
+          grep '\.MMCME2_ADV\.' orig.fasm > out/orig_mmcm.txt
+          for P in $(echo "$PLANS" | tr ',' ' '); do
+            IFS=: read -r NAME M D0 D1 D2 D3 <<< "$P"
+            python3 - "$M" "$D0" "$D1" "$D2" "$D3" <<'PY'
+          import json, sys
+          M, D0, D1, D2, D3 = (format(int(x), 'b') for x in sys.argv[1:6])
+          d = json.load(open('orig.json')); n = 0
+          for mod in d['modules'].values():
+              for c in mod.get('cells', {}).values():
+                  if c['type'] == 'MMCME2_ADV':
+                      p = c['parameters']; print('old', {k: p[k] for k in p if 'DIVIDE' in k or 'MULT' in k or 'PHASE' in k})
+                      p['CLKFBOUT_MULT_F'] = M; p['CLKOUT0_DIVIDE_F'] = D0; p['CLKOUT1_DIVIDE'] = D1
+                      p['CLKOUT2_DIVIDE'] = D2; p['CLKOUT3_DIVIDE'] = D3; n += 1
+                      print('new', {k: p[k] for k in p if 'DIVIDE' in k or 'MULT' in k or 'PHASE' in k})
+          assert n == 1, n
+          json.dump(d, open('plan.json', 'w'))
+          PY
+            echo "== plan $NAME: VCO $((100*M)) MHz, sys $((100*M))/$D0, sys2x /$D1, dqs /$D2 @90, idelay /$D3"
+            pnr plan.json plan.fasm out/$NAME.plan.log
+            grep '\.MMCME2_ADV\.' plan.fasm > out/${NAME}_mmcm.txt
+            python3 - orig.fasm plan.fasm $NAME.fasm <<'PY'
+          import sys
+          a = open(sys.argv[1]).read().splitlines(); b = open(sys.argv[2]).read().splitlines()
+          mm = lambda L: [l for l in L if '.MMCME2_ADV.' in l]
+          ma, mb = mm(a), mm(b)
+          sa = {l.split('.')[0] for l in ma}; sb = {l.split('.')[0] for l in mb}
+          assert len(sa) == 1 and sa == sb, f"MMCM tiles differ: {sa} vs {sb}"
+          out, done = [], False
+          for l in a:
+              if '.MMCME2_ADV.' in l:
+                  if not done: out.extend(mb); done = True
+                  continue
+              out.append(l)
+          open(sys.argv[3], 'w').write('\n'.join(out) + '\n')
+          ra = set(a) - set(ma); rb = set(b) - set(mb)
+          print(f"tile {sa.pop()}: {len(ma)} -> {len(mb)} MMCM features, {len(set(ma) ^ set(mb))} differ; "
+                f"other lines {len(ra)} kept; plan build's non-MMCM lines differ from the original in {len(ra ^ rb)}")
+          PY
+            bitgen $NAME.fasm out/$NAME.bit; md5sum out/$NAME.bit
+            rm -f plan.json plan.fasm $NAME.fasm
+          done
+          rm -f orig.json orig.fasm
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reclock-${{ inputs.variant }}-s${{ inputs.seed }}
+          path: /home/runner/w/out/
+          retention-days: 7
