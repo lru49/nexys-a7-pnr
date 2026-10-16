@@ -1,0 +1,45 @@
+name: pack
+on:
+  workflow_dispatch:
+    inputs:
+      variants: { description: "comma-separated nets/<variant> to pack (one job, sequential)", required: true }
+permissions:
+  contents: read
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VARIANTS: ${{ inputs.variants }}
+      OXC: ${{ github.workspace }}/../oxc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../oxc
+          key: openxc7-linux-x86-64-20261014
+      - name: toolchain
+        run: |
+          if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
+            mkdir -p "$OXC"
+            curl -sSL https://github.com/fpgawars/tools-openxc7/releases/download/2026-10-14/apio-openxc7-linux-x86-64-20261014.tgz | tar -xz -C "$OXC"
+          fi
+          "$OXC/bin/nextpnr-xilinx" --version
+      - name: pack only
+        run: |
+          mkdir -p out
+          for V in $(echo "$VARIANTS" | tr ',' ' '); do
+            gunzip -c "nets/$V/top.json.gz" > top.json
+            "$OXC/bin/nextpnr-xilinx" --device xc7a100tcsg324-1 \
+              --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+              --json top.json --pack-only -o xdc=nets/$V/pins.xdc > out/pack-$V.log 2>&1
+            echo "exit=$?" >> out/pack-$V.log
+            echo "$V $(grep -E 'SLICE_LUTX:|SLICE_FFX:|CARRY4:' out/pack-$V.log | tr -s ' ' | tr '\n' ' ')"
+          done
+          rm -f top.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pack
+          path: out/
+          retention-days: 7
