@@ -17,12 +17,14 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../oxc
-          key: openxc7-linux-x86-64-20261014
+          key: openxc7-linux-x86-64-20261012
       - name: toolchain
         run: |
           if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
             mkdir -p "$OXC"
-            curl -sSL https://github.com/fpgawars/tools-openxc7/releases/download/2026-10-14/apio-openxc7-linux-x86-64-20261014.tgz | tar -xz -C "$OXC"
+            curl -sSL -o /tmp/oxc.tgz https://github.com/cavearr/toolchain-openxc7-releases/releases/download/2026-10-12/openxc7-toolchain-linux-x86-64-20261012.tgz
+            echo "a0d583457dee3644fdca83e556a8106c58aba5fb88f23e30f1270f3a309d0ec8  /tmp/oxc.tgz" | sha256sum -c -
+            tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
           fi
           "$OXC/bin/nextpnr-xilinx" --version
       - name: pack only
