@@ -1,0 +1,6 @@
+set_property LOC E3 [get_ports clk]
+set_property IOSTANDARD LVCMOS33 [get_ports clk]
+set_property LOC J15 [get_ports sin]
+set_property IOSTANDARD LVCMOS33 [get_ports sin]
+set_property LOC H17 [get_ports sout]
+set_property IOSTANDARD LVCMOS33 [get_ports sout]
