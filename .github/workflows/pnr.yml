@@ -61,7 +61,7 @@ jobs:
           PID=$!
           while kill -0 $PID 2>/dev/null; do
             sleep 20
-            if [ "${MAXITER:-0}" -gt 0 ] && [ "$(grep -c ' wires=' pnr.log)" -gt "$MAXITER" ]; then
+            if [ "${MAXITER:-0}" -gt 0 ] && [ "$(grep -c ' wires=' pnr.log)" -gt "$MAXITER" ] && ! grep -q 'Routing complete' pnr.log; then
               echo "early-kill: router passed $MAXITER iterations" >> pnr.log; kill $PID; break
             fi
           done
