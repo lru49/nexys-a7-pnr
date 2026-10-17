@@ -3,7 +3,7 @@ name: rephase
 # then for every base and every k write ONLY the two CLKOUT2 phase fields of the MMCM FASM
 # (CLKOUT2_CLKOUT1_PHASE_MUX[2:0] = 1/8 VCO, CLKOUT2_CLKOUT2_DELAY_TIME[5:0] = whole VCO cycles):
 # phase = (8*DELAY + MUX + k) / (8*D2) * 360. Asserts: only those two lines differ from the base, k = 0 is the base
-# bitstream byte for byte, and (xcheck) a netlist copy routed with CLKOUT2_PHASE = 90 + k*360/(8*D2) gives MMCM lines
+# (FASM identical and configuration data identical after the sync word; the header names the .frames file), and (xcheck) a netlist copy routed with CLKOUT2_PHASE = 90 + k*360/(8*D2) gives MMCM lines
 # identical to the direct edit (only for k with an integer phase).
 # bases = name:orig or name:MULT:D0:D1:D2:D3 (100 MHz in, DIVCLK 1), comma-separated.
 on:
@@ -160,7 +160,11 @@ jobs:
               python3 phase.py base_mmcm.txt $K out/$NAME/${T}_mmcm.txt | tee -a out/$NAME/phases.txt
               python3 swap.py base.fasm out/$NAME/${T}_mmcm.txt k.fasm > /dev/null
               bitgen k.fasm out/$NAME/$T.bit
-              if [ "$K" = "0" ]; then if cmp out/$NAME/$T.bit out/$NAME/base.bit; then echo "k=0 == base bitstream" | tee -a out/$NAME/phases.txt; else echo "k=0 != base"; exit 1; fi; fi
+              if [ "$K" = "0" ]; then  # the .bit header carries the .frames file name, so compare from the sync word on
+                if cmp -s k.fasm base.fasm && python3 -c "import sys; s=lambda f:(lambda x:x[x.index(bytes.fromhex('aa995566')):])(open(f,'rb').read()); sys.exit(s(sys.argv[1])!=s(sys.argv[2]))" out/$NAME/$T.bit out/$NAME/base.bit; then
+                  echo "k=0 == base (FASM identical, configuration data identical after the sync word)" | tee -a out/$NAME/phases.txt
+                else echo "k=0 != base"; exit 1; fi
+              fi
               if echo ",$XCHECK," | grep -q ",$K,"; then
                 if [ $(( (K * 360) % (8 * D2) )) -eq 0 ]; then
                   PH=$(( 90 + K * 360 / (8 * D2) ))
