@@ -1,0 +1,184 @@
+name: rephase
+# Write-DQS phase sets (write-eye sweep): reproduce a routed seed, optionally re-clock it to MMCM plans (as reclock.yml),
+# then for every base and every k write ONLY the two CLKOUT2 phase fields of the MMCM FASM
+# (CLKOUT2_CLKOUT1_PHASE_MUX[2:0] = 1/8 VCO, CLKOUT2_CLKOUT2_DELAY_TIME[5:0] = whole VCO cycles):
+# phase = (8*DELAY + MUX + k) / (8*D2) * 360. Asserts: only those two lines differ from the base, k = 0 is the base
+# bitstream byte for byte, and (xcheck) a netlist copy routed with CLKOUT2_PHASE = 90 + k*360/(8*D2) gives MMCM lines
+# identical to the direct edit (only for k with an integer phase).
+# bases = name:orig or name:MULT:D0:D1:D2:D3 (100 MHz in, DIVCLK 1), comma-separated.
+on:
+  workflow_dispatch:
+    inputs:
+      variant: { description: "nets/<variant>", required: true }
+      seed:    { description: "seed of the routed design", required: true }
+      freq:    { description: "--freq of the routed design", required: true }
+      extra:   { description: "extra nextpnr options of the routed design", required: false, default: "--placer static" }
+      bases:   { description: "name:orig | name:MULT:D0:D1:D2:D3, comma-separated", required: true }
+      ks:      { description: "phase steps k (1/8 VCO each), comma-separated", required: false, default: "-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7,8" }
+      xcheck:  { description: "k values to cross-check by routing (integer phases only)", required: false, default: "-8,-7,-4,4,7,8" }
+permissions:
+  contents: read
+jobs:
+  rephase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VARIANT: ${{ inputs.variant }}
+      SEED: ${{ inputs.seed }}
+      FREQ: ${{ inputs.freq }}
+      EXTRA: ${{ inputs.extra }}
+      BASES: ${{ inputs.bases }}
+      KS: ${{ inputs.ks }}
+      XCHECK: ${{ inputs.xcheck }}
+      OXC: /home/runner/oxc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: nets/${{ inputs.variant }}
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/oxc
+          key: openxc7-linux-x86-64-20261012
+      - name: toolchain
+        run: |
+          if [ ! -x "$OXC/bin/nextpnr-xilinx" ]; then
+            mkdir -p "$OXC"
+            curl -sSL -o /tmp/oxc.tgz https://github.com/cavearr/toolchain-openxc7-releases/releases/download/2026-10-12/openxc7-toolchain-linux-x86-64-20261012.tgz
+            echo "a0d583457dee3644fdca83e556a8106c58aba5fb88f23e30f1270f3a309d0ec8  /tmp/oxc.tgz" | sha256sum -c -
+            tar -xzf /tmp/oxc.tgz -C "$OXC" && rm /tmp/oxc.tgz
+          fi
+          ls "$OXC/bin" | grep -E "fasm2frames|xc7frames2bit|nextpnr"
+      - name: run
+        run: |
+          set -e
+          mkdir -p /home/runner/w/out && cd /home/runner/w
+          DB="$OXC/share/nextpnr/external/prjxray-db/artix7"; PART=xc7a100tcsg324-1
+          pnr() {  # json fasm log
+            "$OXC/bin/nextpnr-xilinx" --device $PART --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
+              --json "$1" --freq "$FREQ" --seed "$SEED" $EXTRA --timing-allow-fail \
+              -o xdc="$GITHUB_WORKSPACE/nets/$VARIANT/pins.xdc" -o fasm="$2" > "$3" 2>&1 || echo "nextpnr exit $?"
+            grep -E "Max frequency" "$3" | tail -4
+          }
+          bitgen() {  # fasm bit
+            "$OXC/bin/fasm2frames" --db-root "$DB" --part $PART "$1" "${1%.fasm}.frames"
+            "$OXC/bin/xc7frames2bit" --part_file "$DB/$PART/part.yaml" --part_name $PART --frm_file "${1%.fasm}.frames" --output_file "$2"
+            rm -f "${1%.fasm}.frames"
+          }
+          cat > mod.py <<'PY'
+          import json, sys
+          # mod.py in.json out.json M D0 D1 D2 D3 PHASE2   (M == '-' keeps the dividers)
+          d = json.load(open(sys.argv[1])); n = 0
+          for mod in d['modules'].values():
+              for c in mod.get('cells', {}).values():
+                  if c['type'] == 'MMCME2_ADV':
+                      p = c['parameters']
+                      if sys.argv[3] != '-':
+                          M, D0, D1, D2, D3 = (format(int(x), 'b') for x in sys.argv[3:8])
+                          p['CLKFBOUT_MULT_F'] = M; p['CLKOUT0_DIVIDE_F'] = D0; p['CLKOUT1_DIVIDE'] = D1
+                          p['CLKOUT2_DIVIDE'] = D2; p['CLKOUT3_DIVIDE'] = D3
+                      p['CLKOUT2_PHASE'] = format(int(sys.argv[8]), 'b'); n += 1
+                      print({k: p[k] for k in p if 'DIVIDE' in k or 'MULT' in k or 'PHASE' in k})
+          assert n == 1, n
+          json.dump(d, open(sys.argv[2], 'w'))
+          PY
+          cat > swap.py <<'PY'
+          import sys
+          # swap.py base.fasm mmcm_lines.txt out.fasm : replace the MMCM lines of base by the given ones
+          a = open(sys.argv[1]).read().splitlines(); mb = open(sys.argv[2]).read().splitlines()
+          ma = [l for l in a if '.MMCME2_ADV.' in l]
+          sa = {l.split('.')[0] for l in ma}; sb = {l.split('.')[0] for l in mb}
+          assert len(sa) == 1 and sa == sb, (sa, sb)
+          out, done = [], False
+          for l in a:
+              if '.MMCME2_ADV.' in l:
+                  if not done: out.extend(mb); done = True
+                  continue
+              out.append(l)
+          open(sys.argv[3], 'w').write('\n'.join(out) + '\n')
+          print(f"{len(set(ma) ^ set(mb))} MMCM lines differ")
+          PY
+          cat > phase.py <<'PY'
+          import re, sys
+          # phase.py mmcm.txt k out.txt : add k eighths of a VCO cycle to CLKOUT2's phase (two fields only)
+          L = open(sys.argv[1]).read().splitlines(); k = int(sys.argv[2])
+          def get(f):
+              m = [l for l in L if l.split('.', 2)[2].startswith(f)]
+              assert len(m) == 1, (f, m); return m[0]
+          mux_l, del_l = get('CLKOUT2_CLKOUT1_PHASE_MUX[2:0]'), get('CLKOUT2_CLKOUT2_DELAY_TIME[5:0]')
+          mux = int(mux_l.split("'b")[1], 2); dly = int(del_l.split("'b")[1], 2)
+          hi = int(get('CLKOUT2_CLKOUT1_HIGH_TIME[5:0]').split("'b")[1], 2); lo = int(get('CLKOUT2_CLKOUT1_LOW_TIME[5:0]').split("'b")[1], 2)
+          d2 = hi + lo
+          tot = 8 * dly + mux + k; assert 0 <= tot < 64 * 8, tot
+          nm, nd = tot % 8, tot // 8
+          new = [l.replace(mux_l.split(' = ')[1], f"3'b{nm:03b}") if l == mux_l else
+                 l.replace(del_l.split(' = ')[1], f"6'b{nd:06b}") if l == del_l else l for l in L]
+          diff = [x for x in zip(L, new) if x[0] != x[1]]
+          assert all('CLKOUT2_CLKOUT1_PHASE_MUX' in a or 'CLKOUT2_CLKOUT2_DELAY_TIME' in a for a, b in diff), diff
+          open(sys.argv[3], 'w').write('\n'.join(new) + '\n')
+          print(f"D2={d2} base {8*dly+mux}/8 VCO = {(8*dly+mux)/(8*d2)*360:.3f} deg -> k={k:+d}: DELAY {nd} MUX {nm} = {tot/(8*d2)*360:.3f} deg ({len(diff)} lines changed)")
+          PY
+          gunzip -c "$GITHUB_WORKSPACE/nets/$VARIANT/top.json.gz" > orig.json
+          echo "== original $VARIANT s$SEED @$FREQ"; pnr orig.json orig.fasm out/orig.log
+          bitgen orig.fasm out/orig.bit; md5sum out/orig.bit | tee out/orig.md5
+          grep '\.MMCME2_ADV\.' orig.fasm > orig_mmcm.txt
+          for B in $(echo "$BASES" | tr ',' ' '); do
+            IFS=: read -r NAME M D0 D1 D2 D3 <<< "$B"
+            mkdir -p out/$NAME
+            if [ "$M" = "orig" ]; then
+              cp orig.fasm base.fasm; cp orig_mmcm.txt base_mmcm.txt; PM="-"; D2=$(python3 -c "
+          import sys; L=open('orig_mmcm.txt').read().splitlines()
+          g=lambda f:[int(l.split(\"'b\")[1],2) for l in L if f in l][0]
+          print(g('CLKOUT2_CLKOUT1_HIGH_TIME')+g('CLKOUT2_CLKOUT1_LOW_TIME'))")
+            else
+              python3 mod.py orig.json plan.json $M $D0 $D1 $D2 $D3 90
+              echo "== base $NAME: VCO $((100*M)) MHz /$D0 /$D1 /$D2@90 /$D3"; pnr plan.json plan.fasm out/$NAME/plan.log
+              grep '\.MMCME2_ADV\.' plan.fasm > base_mmcm.txt
+              python3 swap.py orig.fasm base_mmcm.txt base.fasm
+              python3 - orig.fasm plan.fasm <<'PY'
+          import sys
+          a = [l for l in open(sys.argv[1]).read().splitlines() if '.MMCME2_ADV.' not in l]
+          b = [l for l in open(sys.argv[2]).read().splitlines() if '.MMCME2_ADV.' not in l]
+          n = len(set(a) ^ set(b)); print(f"plan build non-MMCM lines differ from the original in {n}"); assert n == 0
+          PY
+              PM="$M:$D0:$D1:$D2:$D3"; rm -f plan.json plan.fasm
+            fi
+            cp base_mmcm.txt out/$NAME/base_mmcm.txt
+            bitgen base.fasm out/$NAME/base.bit
+            for K in $(echo "$KS" | tr ',' ' '); do
+              T=$(printf "wp%02d" $((K + 8)))   # wp08 = k 0 = 90 deg
+              python3 phase.py base_mmcm.txt $K out/$NAME/${T}_mmcm.txt | tee -a out/$NAME/phases.txt
+              python3 swap.py base.fasm out/$NAME/${T}_mmcm.txt k.fasm > /dev/null
+              bitgen k.fasm out/$NAME/$T.bit
+              if [ "$K" = "0" ]; then if cmp out/$NAME/$T.bit out/$NAME/base.bit; then echo "k=0 == base bitstream" | tee -a out/$NAME/phases.txt; else echo "k=0 != base"; exit 1; fi; fi
+              if echo ",$XCHECK," | grep -q ",$K,"; then
+                if [ $(( (K * 360) % (8 * D2) )) -eq 0 ]; then
+                  PH=$(( 90 + K * 360 / (8 * D2) ))
+                  if [ "$PM" = "-" ]; then python3 mod.py orig.json x.json - 0 0 0 0 $PH; else python3 mod.py orig.json x.json ${PM//:/ } $PH; fi
+                  pnr x.json x.fasm out/$NAME/xcheck_$T.log > /dev/null
+                  grep '\.MMCME2_ADV\.' x.fasm > x_mmcm.txt
+                  if diff <(sort x_mmcm.txt) <(sort out/$NAME/${T}_mmcm.txt) > out/$NAME/xcheck_$T.diff; then
+                    echo "xcheck k=$K (CLKOUT2_PHASE $PH): routed MMCM lines == direct edit" | tee -a out/$NAME/phases.txt
+                  else
+                    echo "xcheck k=$K (CLKOUT2_PHASE $PH): MISMATCH" | tee -a out/$NAME/phases.txt; cat out/$NAME/xcheck_$T.diff
+                  fi
+                  python3 - orig.fasm x.fasm <<'PY'
+          import sys
+          a = [l for l in open(sys.argv[1]).read().splitlines() if '.MMCME2_ADV.' not in l]
+          b = [l for l in open(sys.argv[2]).read().splitlines() if '.MMCME2_ADV.' not in l]
+          print(f"  xcheck non-MMCM lines differ from the original in {len(set(a) ^ set(b))}")
+          PY
+                  rm -f x.json x.fasm x_mmcm.txt
+                fi
+              fi
+            done
+            rm -f k.fasm base.fasm
+            (cd out/$NAME && md5sum *.bit > md5.txt && gzip -9 *.bit)
+          done
+          gzip -9 out/orig.bit
+          rm -f orig.json orig.fasm
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rephase-${{ inputs.variant }}-s${{ inputs.seed }}
+          path: /home/runner/w/out/
+          retention-days: 7
