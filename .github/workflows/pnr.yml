@@ -150,8 +150,9 @@ jobs:
           for S in $SEEDS; do
             echo "== s$S: $(grep -E "^early-kill|^exit=|^wall_s=" s$S/pnr.log | tr '\n' ' ')"
             grep -E "Max frequency" s$S/pnr.log | tail -4
-            [ -f s$S/top.bit.gz ] && echo "   bitstream: s$S/top.bit.gz"
+            if [ -f s$S/top.bit.gz ]; then echo "   bitstream: s$S/top.bit.gz"; fi
           done
+          true
       - name: DSP placement dump (with extra --write placed.json)
         if: ${{ always() && contains(inputs.extra, '--write placed.json') }}
         run: |
