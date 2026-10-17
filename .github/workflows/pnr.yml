@@ -10,6 +10,7 @@ on:
       maxiter: { description: "kill the router after this many iterations (0 = never)", required: false, default: "60" }
       nextpnr: { description: "release = the openXC7 release binary; r43 = openXC7/nextpnr 8006fbc6f8f7 + patches/nextpnr-r43.patch, built here; np31 = r43 + patches/nextpnr-np31.patch (env-gated placer knobs)", required: false, default: "release" }
       npenv:   { description: "environment for nextpnr, e.g. NP_TMG_K=20 NP_TMG_CAP=0 (np31 knobs)", required: false, default: "" }
+      sdf:     { description: "1 = also write top.sdf per seed (nextpnr --sdf; output-only), uploaded as s<seed>/top.sdf.gz in the log artifact", required: false, default: "0" }
       tune:    { description: "per-job knobs: threads per seed, parallel seeds, wall-time kill per seed in minutes", required: false, default: "threads=1 per_job=1 wallmin=45" }
 permissions:
   contents: read
@@ -66,6 +67,7 @@ jobs:
       MAXITER: ${{ inputs.maxiter }}
       NEXTPNR: ${{ inputs.nextpnr }}
       NPENV: ${{ inputs.npenv }}
+      SDF: ${{ inputs.sdf }}
       OXC: /home/runner/oxc
     steps:
       - uses: actions/checkout@v4
@@ -112,13 +114,14 @@ jobs:
           echo "threads=$threads per_job=$per_job wallmin=$wallmin seeds=$SEEDS"
           mkdir -p out && cd out && ln -sfn ../nets nets   # so extra '-o preplaced=../nets/...' still resolves from out/s<seed>
           NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" != release ] && NPR="/home/runner/npr/nextpnr-himbaechel"
+          SDFOPT=""; [ "${SDF:-0}" = 1 ] && case " $EXTRA " in *" --sdf "*) ;; *) SDFOPT="--sdf top.sdf" ;; esac
           one() {   # $1 = seed; runs in out/s$1
             local S=$1 T0=$SECONDS PID; mkdir -p s$S && cd s$S
             gunzip -c "../../nets/$VARIANT/top.json.gz" > top.json; cp "../../nets/$VARIANT/pins.xdc" .
             echo "binary: $NPR ($NEXTPNR) env: $NPENV threads: $threads seed: $S" > pnr.log
             env $NPENV /usr/bin/time -v -o time.log "$NPR" --device xc7a100tcsg324-1 \
               --chipdb "$OXC/share/nextpnr/himbaechel/xilinx/chipdb-xc7a100t.bin" \
-              --json top.json --freq "$FREQ" --seed "$S" --threads "$threads" $EXTRA --timing-allow-fail \
+              --json top.json --freq "$FREQ" --seed "$S" --threads "$threads" $EXTRA $SDFOPT --timing-allow-fail \
               -o xdc=pins.xdc -o fasm=top.fasm --report report.json >> pnr.log 2>&1 &
             PID=$!
             while kill -0 $PID 2>/dev/null; do
@@ -185,9 +188,9 @@ jobs:
           PY
           for d in out/s*/; do [ -f $d/dsp_place.txt ] && { echo "== $d"; grep '^# ' $d/dsp_place.txt; }; done
       - name: synchroniser routes from SDF (with extra --sdf top.sdf; research r48 C2 fine, r61 NEGCAP hop)
-        if: ${{ always() && contains(inputs.extra, '--sdf top.sdf') }}
+        if: ${{ always() && (inputs.sdf == '1' || contains(inputs.extra, '--sdf top.sdf')) }}
         run: |
-          for d in out/s*/; do [ -f $d/top.sdf ] && python3 - $d/top.sdf $d/placed.json <<'PY' > $d/sync_routes.txt; rm -f $d/top.sdf $d/placed.json; done
+          for d in out/s*/; do [ -f $d/top.sdf ] && python3 - $d/top.sdf $d/placed.json <<'PY' > $d/sync_routes.txt; rm -f $d/placed.json; done
           import json, os, re, sys, collections
           # cell -> names of its output nets (FF cells are renamed by abc9; their Q nets keep the RTL names), from the
           # --write JSON when present. A sink is selected when its cell or Q-net name matches SEL (synchronisers
@@ -219,9 +222,9 @@ jobs:
               src, dst, v = (norm(x) for x in mm.groups())
               dc = dst.rsplit('/', 1)[0]; sc = src.rsplit('/', 1)[0]
               if not (SEL.search(dc) or any(SEL.search(x) for x in onames.get(dc, []))): continue
-              dly = max([float(x) for x in re.findall(r'-?[0-9.]+', v)] or [0.0])
+              dly = max([float(x) for x in re.findall(r'-?[0-9.]+', v)] or [0.0]) / (1000.0 if '1ps' in ts else 1.0)   # nextpnr: TIMESCALE 1ps
               if dly > worst.get(dst, (-1,))[0]: worst[dst] = (dly, src, label(sc), label(dc))
-          print(f'# {n} INTERCONNECT entries, {len(worst)} selected sink pins; delay (SDF units = ns), source net, sink net')
+          print(f'# {n} INTERCONNECT entries, {len(worst)} selected sink pins; delay (ns, converted from the SDF TIMESCALE), source net, sink net')
           for dst, (dly, src, sl, dl) in sorted(worst.items(), key=lambda x: -x[1][0]): print(f'{dly:.3f}\t{sl}\t{dl}\t{src}\t{dst}')
           neg = [w for w in worst.values() if 't_sync_n' in w[2] and 'tq' in w[3]]
           print(f"# NEGCAP hop t_sync_n -> tq: {len(neg)} routes, worst {max([w[0] for w in neg] or [0]):.3f} ns (gate <= 1.5)")
@@ -240,8 +243,14 @@ jobs:
                   if port in ("T1",) or (len(port) == 2 and port[0] == "D" and port[1] in "12345678"):
                       d = float(e.get("delay", 0.0))
                       if d > worst[port][0]: worst[port] = (d, f'{n.get("net", "?")} -> {e.get("cell", "?")}')
-          for port in sorted(worst): print(f"max route delay to OSERDES-type port {port}: {worst[port][0]:.3f} ns ({worst[port][1]})")
+          # report.json endpoint 'delay' is the arrival, and OSERDES pins are never timing endpoints (no IOLOGIC timing),
+          # so this cannot measure OSERDES input routes; those are in the SDF INTERCONNECT lines (sdf=1).
+          for port in sorted(worst): print(f"endpoint arrival at OSERDES-type port {port}: {worst[port][0]:.3f} ns ({worst[port][1]})")
+          if not worst: print("OSERDES input route delays: N/A (report.json has no OSERDES endpoints; use sdf=1 and read the INTERCONNECT lines of top.sdf.gz)")
           PY
+      - name: compress SDF for upload (sdf=1)
+        if: always()
+        run: for d in out/s*/; do [ -f $d/top.sdf ] && gzip -9f $d/top.sdf; done; ls -la out/s*/top.sdf.gz 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -251,6 +260,9 @@ jobs:
             out/s*/time.log
             out/s*/report.json
             out/s*/oserdes_nets.txt
+            out/s*/sync_routes.txt
+            out/s*/dsp_place.txt
+            out/s*/top.sdf.gz
           retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
