@@ -1,10 +1,11 @@
 name: rephase
 # Write-DQS phase sets (write-eye sweep): reproduce a routed seed, optionally re-clock it to MMCM plans (as reclock.yml),
-# then for every base and every k write ONLY the two CLKOUT2 phase fields of the MMCM FASM
-# (CLKOUT2_CLKOUT1_PHASE_MUX[2:0] = 1/8 VCO, CLKOUT2_CLKOUT2_DELAY_TIME[5:0] = whole VCO cycles):
-# phase = (8*DELAY + MUX + k) / (8*D2) * 360. Asserts: only those two lines differ from the base, k = 0 is the base
+# then for every base and every k write the two CLKOUT2 phase fields of the MMCM FASM
+# (CLKOUT2_CLKOUT1_PHASE_MUX[2:0] = 1/8 VCO, CLKOUT2_CLKOUT2_DELAY_TIME[5:0] = whole VCO cycles) plus POWER_REG, recomputed
+# as nextpnr's write_mmcm does (0x9900 if any used output has PHASE_MUX % 4 != 0 or a fractional divide, else 0x0100):
+# phase = (8*DELAY + MUX + k) / (8*D2) * 360. Asserts: only those three lines differ from the base, k = 0 is the base
 # (FASM identical and configuration data identical after the sync word; the header names the .frames file), and (xcheck) a netlist copy routed with CLKOUT2_PHASE = 90 + k*360/(8*D2) gives MMCM lines
-# identical to the direct edit (only for k with an integer phase).
+# identical to the direct edit (any k; the phase goes in as a real-valued string; a mismatch fails the run).
 # bases = name:orig or name:MULT:D0:D1:D2:D3 (100 MHz in, DIVCLK 1), comma-separated.
 on:
   workflow_dispatch:
@@ -15,7 +16,7 @@ on:
       extra:   { description: "extra nextpnr options of the routed design", required: false, default: "--placer static" }
       bases:   { description: "name:orig | name:MULT:D0:D1:D2:D3, comma-separated", required: true }
       ks:      { description: "phase steps k (1/8 VCO each), comma-separated", required: false, default: "-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7,8" }
-      xcheck:  { description: "k values to cross-check by routing (integer phases only)", required: false, default: "-8,-7,-4,4,7,8" }
+      xcheck:  { description: "k values to cross-check by routing (cover MUX % 4 == 0 and != 0)", required: false, default: "-8,-2,-1,1,2,8" }
       drive16: { description: "bases that also get a k=0 FPGA DRIVE 16 variant (LVCMOS18.DRIVE.I12_I8 -> I16 on every LVCMOS18 IOB)", required: false, default: "" }
 permissions:
   contents: read
@@ -78,7 +79,8 @@ jobs:
                           M, D0, D1, D2, D3 = (format(int(x), 'b') for x in sys.argv[3:8])
                           p['CLKFBOUT_MULT_F'] = M; p['CLKOUT0_DIVIDE_F'] = D0; p['CLKOUT1_DIVIDE'] = D1
                           p['CLKOUT2_DIVIDE'] = D2; p['CLKOUT3_DIVIDE'] = D3
-                      p['CLKOUT2_PHASE'] = format(int(sys.argv[8]), 'b'); n += 1
+                      ph = float(sys.argv[8])   # integer phases as before (binary); others as a real-valued string (nextpnr stod)
+                      p['CLKOUT2_PHASE'] = format(int(ph), 'b') if ph.is_integer() and '.' not in sys.argv[8] else f"{ph:.6f}"; n += 1
                       print({k: p[k] for k in p if 'DIVIDE' in k or 'MULT' in k or 'PHASE' in k})
           assert n == 1, n
           json.dump(d, open(sys.argv[2], 'w'))
@@ -101,24 +103,41 @@ jobs:
           PY
           cat > phase.py <<'PY'
           import re, sys
-          # phase.py mmcm.txt k out.txt : add k eighths of a VCO cycle to CLKOUT2's phase (two fields only)
+          # phase.py mmcm.txt k out.txt : add k eighths of a VCO cycle to CLKOUT2's phase.
+          # r68 fix: besides CLKOUT2_CLKOUT1_PHASE_MUX / CLKOUT2_CLKOUT2_DELAY_TIME, recompute
+          # POWER_REG_POWER_REG_POWER_REG[15:0] exactly as nextpnr-xilinx fasm.cc write_mmcm does:
+          # 0x9900 if any used output (CLKFBOUT always, CLKOUTn with OUTPUT_ENABLE) has FRAC_EN or PHASE_MUX % 4 != 0,
+          # else 0x0100. Without it, a base whose outputs all sit on MUX 0/4 (e.g. 90 deg at an even D2) keeps 0x0100
+          # and every k with MUX[1:0] != 0 produces a dead write-DQS clock (ddr167g1, 2026-10-17).
           L = open(sys.argv[1]).read().splitlines(); k = int(sys.argv[2])
           def get(f):
               m = [l for l in L if l.split('.', 2)[2].startswith(f)]
               assert len(m) == 1, (f, m); return m[0]
-          mux_l, del_l = get('CLKOUT2_CLKOUT1_PHASE_MUX[2:0]'), get('CLKOUT2_CLKOUT2_DELAY_TIME[5:0]')
-          mux = int(mux_l.split("'b")[1], 2); dly = int(del_l.split("'b")[1], 2)
-          hi = int(get('CLKOUT2_CLKOUT1_HIGH_TIME[5:0]').split("'b")[1], 2); lo = int(get('CLKOUT2_CLKOUT1_LOW_TIME[5:0]').split("'b")[1], 2)
-          d2 = hi + lo
+          val = lambda l: int(l.split("'b")[1], 2)
+          mux_l, del_l, pw_l = get('CLKOUT2_CLKOUT1_PHASE_MUX[2:0]'), get('CLKOUT2_CLKOUT2_DELAY_TIME[5:0]'), get('POWER_REG_POWER_REG_POWER_REG[15:0]')
+          mux, dly = val(mux_l), val(del_l)
+          d2 = val(get('CLKOUT2_CLKOUT1_HIGH_TIME[5:0]')) + val(get('CLKOUT2_CLKOUT1_LOW_TIME[5:0]'))
           tot = 8 * dly + mux + k; assert 0 <= tot < 64 * 8, tot
           nm, nd = tot % 8, tot // 8
+          feat = {l.split('.', 2)[2].split(' = ')[0]: (val(l) if "'b" in l else 1) for l in L}
+          need = False
+          for o in ['CLKFBOUT'] + [f'CLKOUT{i}' for i in range(7)]:
+              if o == 'CLKFBOUT' or feat.get(f'{o}_CLKOUT1_OUTPUT_ENABLE[0]'):
+                  m = nm if o == 'CLKOUT2' else feat.get(f'{o}_CLKOUT1_PHASE_MUX[2:0]', 0)
+                  if m % 4 or feat.get(f'{o}_CLKOUT2_FRAC_EN[0]'):
+                      need = True
+          pw = 0x9900 if need else 0x0100
           new = [l.replace(mux_l.split(' = ')[1], f"3'b{nm:03b}") if l == mux_l else
-                 l.replace(del_l.split(' = ')[1], f"6'b{nd:06b}") if l == del_l else l for l in L]
+                 l.replace(del_l.split(' = ')[1], f"6'b{nd:06b}") if l == del_l else
+                 l.replace(pw_l.split(' = ')[1], f"16'b{pw:016b}") if l == pw_l else l for l in L]
           diff = [x for x in zip(L, new) if x[0] != x[1]]
-          assert all('CLKOUT2_CLKOUT1_PHASE_MUX' in a or 'CLKOUT2_CLKOUT2_DELAY_TIME' in a for a, b in diff), diff
+          assert all(any(f in a for f in ('CLKOUT2_CLKOUT1_PHASE_MUX', 'CLKOUT2_CLKOUT2_DELAY_TIME', 'POWER_REG_POWER_REG'))
+                     for a, b in diff), diff
           open(sys.argv[3], 'w').write('\n'.join(new) + '\n')
-          print(f"D2={d2} base {8*dly+mux}/8 VCO = {(8*dly+mux)/(8*d2)*360:.3f} deg -> k={k:+d}: DELAY {nd} MUX {nm} = {tot/(8*d2)*360:.3f} deg ({len(diff)} lines changed)")
+          print(f"D2={d2} base {8*dly+mux}/8 VCO = {(8*dly+mux)/(8*d2)*360:.3f} deg -> k={k:+d}: DELAY {nd} MUX {nm} POWER 0x{pw:04x}"
+                f" = {tot/(8*d2)*360:.3f} deg ({len(diff)} lines changed)")
           PY
+          FAILX=""
           gunzip -c "$GITHUB_WORKSPACE/nets/$VARIANT/top.json.gz" > orig.json
           echo "== original $VARIANT s$SEED @$FREQ"; pnr orig.json orig.fasm out/orig.log
           bitgen orig.fasm out/orig.bit; md5sum out/orig.bit | tee out/orig.md5
@@ -166,15 +185,15 @@ jobs:
                 else echo "k=0 != base"; exit 1; fi
               fi
               if echo ",$XCHECK," | grep -q ",$K,"; then
-                if [ $(( (K * 360) % (8 * D2) )) -eq 0 ]; then
-                  PH=$(( 90 + K * 360 / (8 * D2) ))
+                if true; then
+                  PH=$(python3 -c "k, d = $K, $D2; ph = 90 + k * 360 / (8 * d); print(int(ph) if ph == int(ph) else f'{ph:.6f}')")
                   if [ "$PM" = "-" ]; then python3 mod.py orig.json x.json - 0 0 0 0 $PH; else python3 mod.py orig.json x.json ${PM//:/ } $PH; fi
                   pnr x.json x.fasm out/$NAME/xcheck_$T.log > /dev/null
                   grep '\.MMCME2_ADV\.' x.fasm > x_mmcm.txt
                   if diff <(sort x_mmcm.txt) <(sort out/$NAME/${T}_mmcm.txt) > out/$NAME/xcheck_$T.diff; then
                     echo "xcheck k=$K (CLKOUT2_PHASE $PH): routed MMCM lines == direct edit" | tee -a out/$NAME/phases.txt
                   else
-                    echo "xcheck k=$K (CLKOUT2_PHASE $PH): MISMATCH" | tee -a out/$NAME/phases.txt; cat out/$NAME/xcheck_$T.diff
+                    echo "xcheck k=$K (CLKOUT2_PHASE $PH): MISMATCH" | tee -a out/$NAME/phases.txt; cat out/$NAME/xcheck_$T.diff; FAILX="$FAILX $NAME:k=$K"
                   fi
                   python3 - orig.fasm x.fasm <<'PY'
           import sys
@@ -191,6 +210,7 @@ jobs:
           done
           gzip -9 out/orig.bit
           rm -f orig.json orig.fasm
+          if [ -n "$FAILX" ]; then echo "xcheck MISMATCH:$FAILX"; exit 1; fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
