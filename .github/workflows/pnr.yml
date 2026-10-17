@@ -187,6 +187,7 @@ jobs:
           for (blk, x), k in sorted(cols.items()): print(f"# column X{x}: {blk} {k}")
           PY
           for d in out/s*/; do [ -f $d/dsp_place.txt ] && { echo "== $d"; grep '^# ' $d/dsp_place.txt; }; done
+          true
       - name: synchroniser routes from SDF (with extra --sdf top.sdf; research r48 C2 fine, r61 NEGCAP hop)
         if: ${{ always() && (inputs.sdf == '1' || contains(inputs.extra, '--sdf top.sdf')) }}
         run: |
@@ -230,6 +231,7 @@ jobs:
           print(f"# NEGCAP hop t_sync_n -> tq: {len(neg)} routes, worst {max([w[0] for w in neg] or [0]):.3f} ns (gate <= 1.5)")
           PY
           for d in out/s*/; do [ -f $d/sync_routes.txt ] && { echo "== $d"; grep '^#' $d/sync_routes.txt; head -6 $d/sync_routes.txt | grep -v '^#'; }; done
+          true
       - name: OSERDES input net delays (with --detailed-timing-report)
         if: ${{ always() && contains(inputs.extra, 'detailed-timing-report') }}
         run: |
