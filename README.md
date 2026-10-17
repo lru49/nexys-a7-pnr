@@ -10,7 +10,7 @@ The `replay` workflow places and routes a reference netlist for one seed and wri
 `extra: -o preplaced=../nets/<target>/preplaced_<tag>.txt` with `nextpnr: r43`.
 
 `pnr` runs each seed group (input `groups`, a JSON list such as `["1 2 3 4","5 6 7 8"]`; without it, `seeds` forms one
-group) as one job, its seeds in parallel with `--threads 1` (input `tune`: `threads=1 per_job=4 wallmin=45`). A seed is
+group) as one job, its seeds in parallel with `--threads 1` (input `tune`: `threads=1 per_job=1 wallmin=45`; 4 parallel seeds on the 2-core SMT runner were >4.5x slower per seed). A seed is
 killed after `maxiter` router iterations or `wallmin` minutes of wall time (logged as `early-kill: ...`), the job after
 90 minutes. Per group it uploads `log-<variant>-g<first seed>` (`s<seed>/pnr.log`, `time.log` with the peak memory,
 `report.json`) and `bit-<variant>-g<first seed>` (`s<seed>/top.bit.gz` of every routed seed).

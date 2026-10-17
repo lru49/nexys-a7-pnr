@@ -10,7 +10,7 @@ on:
       maxiter: { description: "kill the router after this many iterations (0 = never)", required: false, default: "60" }
       nextpnr: { description: "release = the openXC7 release binary; r43 = openXC7/nextpnr 8006fbc6f8f7 + patches/nextpnr-r43.patch, built here; np31 = r43 + patches/nextpnr-np31.patch (env-gated placer knobs)", required: false, default: "release" }
       npenv:   { description: "environment for nextpnr, e.g. NP_TMG_K=20 NP_TMG_CAP=0 (np31 knobs)", required: false, default: "" }
-      tune:    { description: "per-job knobs: threads per seed, parallel seeds, wall-time kill per seed in minutes", required: false, default: "threads=1 per_job=4 wallmin=45" }
+      tune:    { description: "per-job knobs: threads per seed, parallel seeds, wall-time kill per seed in minutes", required: false, default: "threads=1 per_job=1 wallmin=45" }
 permissions:
   contents: read
 jobs:
@@ -108,7 +108,7 @@ jobs:
       - name: place and route (seeds of the group in parallel)
         env: { SEEDS: "${{ steps.g.outputs.seeds }}" }
         run: |
-          threads=1; per_job=4; wallmin=45; for kv in $TUNE; do case $kv in threads=[0-9]*|per_job=[0-9]*|wallmin=[0-9]*) [[ ${kv#*=} =~ ^[0-9]+$ ]] && eval "${kv%%=*}=${kv#*=}";; esac; done
+          threads=1; per_job=1; wallmin=45; for kv in $TUNE; do case $kv in threads=[0-9]*|per_job=[0-9]*|wallmin=[0-9]*) [[ ${kv#*=} =~ ^[0-9]+$ ]] && eval "${kv%%=*}=${kv#*=}";; esac; done
           echo "threads=$threads per_job=$per_job wallmin=$wallmin seeds=$SEEDS"
           mkdir -p out && cd out && ln -sfn ../nets nets   # so extra '-o preplaced=../nets/...' still resolves from out/s<seed>
           NPR="$OXC/bin/nextpnr-xilinx"; [ "$NEXTPNR" != release ] && NPR="/home/runner/npr/nextpnr-himbaechel"
