@@ -230,7 +230,7 @@ jobs:
           neg = [w for w in worst.values() if 't_sync_n' in w[2] and 'tq' in w[3]]
           print(f"# NEGCAP hop t_sync_n -> tq: {len(neg)} routes, worst {max([w[0] for w in neg] or [0]):.3f} ns (gate <= 1.5)")
           PY
-          for d in out/s*/; do [ -f $d/sync_routes.txt ] && { echo "== $d"; grep '^#' $d/sync_routes.txt; head -6 $d/sync_routes.txt | grep -v '^#'; }; done
+          for d in out/s*/; do [ -f $d/sync_routes.txt ] && { echo "== $d"; grep '^#' $d/sync_routes.txt; head -6 $d/sync_routes.txt | grep -v '^#' || true; }; done
           true
       - name: OSERDES input net delays (with --detailed-timing-report)
         if: ${{ always() && contains(inputs.extra, 'detailed-timing-report') }}
