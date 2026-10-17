@@ -134,6 +134,21 @@ jobs:
           fi
           [ -f top.fasm ] && gzip -9 top.fasm
           grep -E "Max frequency" pnr.log | tail -4 || true
+      - name: OSERDES input net delays (with --detailed-timing-report)
+        if: ${{ always() && contains(inputs.extra, 'detailed-timing-report') }}
+        run: |
+          python3 - out/report.json <<'PY' | tee out/oserdes_nets.txt
+          import json, sys, collections
+          r = json.load(open(sys.argv[1]))
+          worst = collections.defaultdict(lambda: (0.0, ""))
+          for n in r.get("detailed_net_timings", []):
+              for e in n.get("endpoints", []):
+                  port = e.get("port", "")
+                  if port in ("T1",) or (len(port) == 2 and port[0] == "D" and port[1] in "12345678"):
+                      d = float(e.get("delay", 0.0))
+                      if d > worst[port][0]: worst[port] = (d, f'{n.get("net", "?")} -> {e.get("cell", "?")}')
+          for port in sorted(worst): print(f"max route delay to OSERDES-type port {port}: {worst[port][0]:.3f} ns ({worst[port][1]})")
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -141,6 +156,7 @@ jobs:
           path: |
             out/pnr.log
             out/report.json
+            out/oserdes_nets.txt
           retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
