@@ -16,6 +16,7 @@ on:
       bases:   { description: "name:orig | name:MULT:D0:D1:D2:D3, comma-separated", required: true }
       ks:      { description: "phase steps k (1/8 VCO each), comma-separated", required: false, default: "-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7,8" }
       xcheck:  { description: "k values to cross-check by routing (integer phases only)", required: false, default: "-8,-7,-4,4,7,8" }
+      drive16: { description: "bases that also get a k=0 FPGA DRIVE 16 variant (LVCMOS18.DRIVE.I12_I8 -> I16 on every LVCMOS18 IOB)", required: false, default: "" }
 permissions:
   contents: read
 jobs:
@@ -30,6 +31,7 @@ jobs:
       BASES: ${{ inputs.bases }}
       KS: ${{ inputs.ks }}
       XCHECK: ${{ inputs.xcheck }}
+      DRIVE16: ${{ inputs.drive16 }}
       OXC: /home/runner/oxc
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +146,15 @@ jobs:
             fi
             cp base_mmcm.txt out/$NAME/base_mmcm.txt
             bitgen base.fasm out/$NAME/base.bit
+            if echo ",$DRIVE16," | grep -q ",$NAME,"; then
+              N12=$(grep -c '\.LVCMOS18\.DRIVE\.I12_I8$' base.fasm || true)
+              sed 's/\.LVCMOS18\.DRIVE\.I12_I8$/.LVCMOS18.DRIVE.I16/' base.fasm > d16.fasm
+              ND=$(diff base.fasm d16.fasm | grep -c '^>' || true)
+              echo "drive16: $N12 LVCMOS18 I12_I8 IOB lines -> I16, $ND lines changed" | tee -a out/$NAME/phases.txt
+              [ "$N12" -gt 0 ] && [ "$N12" = "$ND" ] || { echo "drive16 line count mismatch"; exit 1; }
+              grep '\.LVCMOS18\.DRIVE\.' d16.fasm > out/$NAME/d16_drive_lines.txt
+              bitgen d16.fasm out/$NAME/d16.bit; rm -f d16.fasm
+            fi
             for K in $(echo "$KS" | tr ',' ' '); do
               T=$(printf "wp%02d" $((K + 8)))   # wp08 = k 0 = 90 deg
               python3 phase.py base_mmcm.txt $K out/$NAME/${T}_mmcm.txt | tee -a out/$NAME/phases.txt
