@@ -152,6 +152,80 @@ jobs:
             grep -E "Max frequency" s$S/pnr.log | tail -4
             [ -f s$S/top.bit.gz ] && echo "   bitstream: s$S/top.bit.gz"
           done
+      - name: DSP placement dump (with extra --write placed.json)
+        if: ${{ always() && contains(inputs.extra, '--write placed.json') }}
+        run: |
+          for d in out/s*/; do [ -f $d/placed.json ] && python3 - $d/placed.json <<'PY' > $d/dsp_place.txt; done
+          import collections, json, re, sys
+          m = json.load(open(sys.argv[1]))['modules']
+          top = next(v for v in m.values() if v.get('attributes', {}).get('top')) if any(v.get('attributes', {}).get('top') for v in m.values()) else max(m.values(), key=lambda v: len(v.get('cells', {})))
+          dsp = {n: c for n, c in top['cells'].items() if 'DSP48E1' in c['type']}
+          drv = {}
+          pb = lambda c, P: [b for k, v in c['connections'].items() if re.match(P + r'(\[\d+\])?$', k) for b in v if isinstance(b, int)]
+          for n, c in dsp.items():
+              for b in pb(c, 'PCOUT'): drv[b] = n
+          site = lambda c: c.get('attributes', {}).get('NEXTPNR_BEL', '-')
+          xy = lambda s: tuple(int(v) for v in re.search(r'DSP48_X(\d+)Y(\d+)', s).groups()) if re.search(r'DSP48_X(\d+)Y(\d+)', s) else None
+          links = ok = 0; bad = []; cols = collections.Counter()
+          print('# cell\tbel\tpcin_from\tlink')
+          for n in sorted(dsp):
+              c = dsp[n]; s = site(c); src = {drv[b] for b in pb(c, 'PCIN') if b in drv}
+              g = re.search(r'g_[a-z0-9]+', n); blk = g.group(0) if g else 'other'; p = xy(s); cols[(blk, p[0] if p else -1)] += 1
+              tag = '-'
+              if src:
+                  links += 1; f = next(iter(src)); q = xy(site(dsp[f]))
+                  legal = bool(p and q and p[0] == q[0] and p[1] == q[1] + 1 and p[1] // 10 == q[1] // 10)
+                  ok += legal; tag = f"from {site(dsp[f])} {'in-segment' if legal else 'ILLEGAL'}"
+                  if not legal: bad.append(f"{f} {site(dsp[f])} -> {n} {s}")
+              print(f"{n}\t{s}\t{','.join(sorted(src)) or '-'}\t{tag}")
+          print(f"# summary: {len(dsp)} DSP48E1, {links} PCIN links, {ok} adjacent in-segment, {len(bad)} other")
+          for b in bad[:20]: print('# other link:', b)
+          for (blk, x), k in sorted(cols.items()): print(f"# column X{x}: {blk} {k}")
+          PY
+          for d in out/s*/; do [ -f $d/dsp_place.txt ] && { echo "== $d"; grep '^# ' $d/dsp_place.txt; }; done
+      - name: synchroniser routes from SDF (with extra --sdf top.sdf; research r48 C2 fine, r61 NEGCAP hop)
+        if: ${{ always() && contains(inputs.extra, '--sdf top.sdf') }}
+        run: |
+          for d in out/s*/; do [ -f $d/top.sdf ] && python3 - $d/top.sdf $d/placed.json <<'PY' > $d/sync_routes.txt; rm -f $d/top.sdf $d/placed.json; done
+          import json, os, re, sys, collections
+          # cell -> names of its output nets (FF cells are renamed by abc9; their Q nets keep the RTL names), from the
+          # --write JSON when present. A sink is selected when its cell or Q-net name matches SEL (synchronisers
+          # *_sync*, the ph sampler and its retiming FF u_ph.tq).
+          SEL = re.compile(r'_sync|u_ph\.tq\b')
+          onames = collections.defaultdict(list)
+          if os.path.exists(sys.argv[2]):
+              m = json.load(open(sys.argv[2]))['modules']
+              top = max(m.values(), key=lambda v: len(v.get('cells', {})))
+              bitname = {}
+              for nn, n in top['netnames'].items():
+                  for b in n['bits']:
+                      if isinstance(b, int) and (b not in bitname or nn.count('.') < bitname[b].count('.')): bitname[b] = nn
+              for cn, c in top['cells'].items():
+                  pd = c.get('port_directions', {})
+                  for p, bits in c['connections'].items():
+                      if pd.get(p) == 'output':
+                          onames[cn] += [bitname[b] for b in bits if isinstance(b, int) and b in bitname]
+          norm = lambda x: x.replace('\\', '')
+          label = lambda cell: (onames.get(cell) or [cell])[0]
+          rx = re.compile(r'\(INTERCONNECT\s+(\S+)\s+(\S+)\s+\(([^)]*)\)')
+          worst = {}; n = 0
+          ts = ''
+          for ln in open(sys.argv[1]):
+              if 'TIMESCALE' in ln and not ts: ts = ln.strip(); print('# ' + ts)
+              mm = rx.search(ln)
+              if not mm: continue
+              n += 1
+              src, dst, v = (norm(x) for x in mm.groups())
+              dc = dst.rsplit('/', 1)[0]; sc = src.rsplit('/', 1)[0]
+              if not (SEL.search(dc) or any(SEL.search(x) for x in onames.get(dc, []))): continue
+              dly = max([float(x) for x in re.findall(r'-?[0-9.]+', v)] or [0.0])
+              if dly > worst.get(dst, (-1,))[0]: worst[dst] = (dly, src, label(sc), label(dc))
+          print(f'# {n} INTERCONNECT entries, {len(worst)} selected sink pins; delay (SDF units = ns), source net, sink net')
+          for dst, (dly, src, sl, dl) in sorted(worst.items(), key=lambda x: -x[1][0]): print(f'{dly:.3f}\t{sl}\t{dl}\t{src}\t{dst}')
+          neg = [w for w in worst.values() if 't_sync_n' in w[2] and 'tq' in w[3]]
+          print(f"# NEGCAP hop t_sync_n -> tq: {len(neg)} routes, worst {max([w[0] for w in neg] or [0]):.3f} ns (gate <= 1.5)")
+          PY
+          for d in out/s*/; do [ -f $d/sync_routes.txt ] && { echo "== $d"; grep '^#' $d/sync_routes.txt; head -6 $d/sync_routes.txt | grep -v '^#'; }; done
       - name: OSERDES input net delays (with --detailed-timing-report)
         if: ${{ always() && contains(inputs.extra, 'detailed-timing-report') }}
         run: |
